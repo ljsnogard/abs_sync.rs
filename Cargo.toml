@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "abs_sync",
+    "atomex-rs",
+    "atomic_sync",
+]
+resolver = "3"

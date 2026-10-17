@@ -1,0 +1,43 @@
+﻿[package]
+name = "atomic_sync"
+version = "0.3.0"
+edition = "2024"
+
+authors = ["lino <lino_snsalias@outlook.com>"]
+description = "Atomic-based synchronization implementing traits in `abs_sync`"
+repository = "https://github.com/ljsnogard/abs_sync.rs"
+keywords = ["sync", "spinlock", "mutex", "rwlock"]
+categories = ["no-std"]
+license = "MIT/Apache-2.0"
+
+[dependencies]
+abs_sync = { path = "../abs_sync" }
+atomex = { path = "../atomex-rs" }
+pin-project = "1"
+
+[dev-dependencies]
+rand = { version = "0.9" }
+futures-lite = { version = "2" }
+env_logger = { version = "0.11.*" }
+log = { version = "0.4.*" }
+# 测试用的真实异步运行时：compio 面向单线程，tokio 支持多线程。
+compio = { version = "0.19.*", features = ["macros", "runtime", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+# bench 都是"自带 main 的测量程序"。要真正跑起来必须关掉 libtest harness，
+# 否则 cargo 会用 harness 的 main 顶掉我们自己的 main（表现为 “running 0 tests”）。
+#
+# - `rwlock_cooperative`：默认就跑；规模可用环境变量调小
+#   （`RWLOCK_BENCH_OPS` / `RWLOCK_BENCH_ROUNDS` / `RWLOCK_BENCH_COMPETITORS`）。
+# - `mutex_contention`：**故意保持不运行**。它是 2,000,000 次操作 × 3 轮 ×
+#   6 种线程数 × 3 个实现的重量级测量，一次跑完需要很久；这里保留它作为
+#   可手动启用的参考实现，而不让 `cargo bench` 默认把它拖起来。
+#   需要时把下面两行取消注释即可：
+#
+#   [[bench]]
+#   name = "mutex_contention"
+#   harness = false
+#
+[[bench]]
+name = "rwlock_cooperative"
+harness = false
