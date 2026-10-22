@@ -20,11 +20,11 @@ use crate::rwlock::TrShareMut;
 
 use super::{
     core_::RwCore,
-    error_::CoopRwLockError,
     reader_::{ReadAcquireAsync, ReaderGuard},
     upgrade_::{UpgradableReadAcquireAsync, UpgradableReaderGuard},
     writer_::{WriteAcquireAsync, WriterGuard},
 };
+use crate::rwlock::error_::CoopRwLockError;
 
 /// 以"借用的原子单元"构造的协作式读写锁。
 pub type CooperativeRwLockBorrowed<'a, T, C = AtomicUsize, O = StrictOrderings> =

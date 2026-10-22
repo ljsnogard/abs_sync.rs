@@ -16,10 +16,9 @@ use atomex::{x_deps::funty, TrAtomicData, TrCmpxchOrderings};
 use abs_cancel::{NonCancellableToken, TrCancellationToken, TrMayCancel};
 use abs_sync::{async_rwlock::*, sync_guard::TrAcqRefGuard, x_deps::abs_cancel};
 
-use super::{
-    core_::AcqProgress,
+use super::{core_::AcqProgress, rwlock_::CooperativeAcqSession};
+use crate::rwlock::{
     error_::CoopRwLockError,
-    rwlock_::CooperativeAcqSession,
     wait_::{WaitKind, WaitNode},
 };
 

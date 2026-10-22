@@ -1,6 +1,9 @@
-//! 等待队列的底层构件：自旋锁、等待节点与队列。
+//! 协作式读写锁等待队列的共享底层构件：自旋锁、等待种类、槽位与节点。
+//!
+//! 这些定义同时服务堆分配队列实现与 Arena 侵入式链实现；具体队列形态由
+//! 各自的 `core_` 负责。
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 use core::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
@@ -268,6 +271,3 @@ impl WaitNode {
         }
     }
 }
-
-/// 等待队列：队首即最先到达的等待者。
-pub(super) type WaitQueue = VecDeque<Arc<WaitNode>>;

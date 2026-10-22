@@ -10,6 +10,12 @@ keywords = ["sync", "spinlock", "mutex", "rwlock"]
 categories = ["no-std"]
 license = "MIT/Apache-2.0"
 
+[features]
+default = []
+# 用 `Arena` + 侵入式双向链表承载 cooperative 读写锁的等待节点。
+# 默认关闭，选择堆分配版；两版对外 API 完全相同。
+cooperative-arena = []
+
 [dependencies]
 abs_sync = { path = "../abs_sync" }
 atomex = { path = "../atomex-rs" }

@@ -40,17 +40,16 @@
 //! 设计讨论与决策因果链见 `dev-notes/rwlock-20260923-2204.md`。
 
 mod core_;
-mod error_;
 mod reader_;
 mod rwlock_;
-mod state_;
-#[cfg(test)]
-mod tests_;
 mod upgrade_;
-mod wait_;
 mod writer_;
 
-pub use error_::CoopRwLockError;
+#[cfg(test)]
+#[path = "../cooperative_tests_.rs"]
+mod tests_;
+
+pub use super::error_::CoopRwLockError;
 pub use reader_::{ReadAcquireAsync, ReadAcquireFuture, ReaderGuard};
 pub use rwlock_::{
     CooperativeAcqSession, CooperativeRwLock, CooperativeRwLockBorrowed,

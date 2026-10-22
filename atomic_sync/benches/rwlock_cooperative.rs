@@ -24,7 +24,10 @@
 //! # 运行
 //!
 //! ```sh
+//! # 默认：堆分配等待队列
 //! cargo bench --bench rwlock_cooperative
+//! # 对照：Arena + 侵入式链表等待队列（对外 API 相同）
+//! cargo bench --features cooperative-arena --bench rwlock_cooperative
 //! ```
 //!
 //! 规模可用环境变量调整：

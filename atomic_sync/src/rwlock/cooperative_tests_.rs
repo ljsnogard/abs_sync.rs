@@ -11,8 +11,8 @@ use core::future::{Future, IntoFuture};
 use std::{
     boxed::Box,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
     vec::Vec,
@@ -112,11 +112,7 @@ async fn cancelled_head_waiter_should_not_starve_followers() {
     let_tasks_settle().await;
     drop(hold);
 
-    let done = with_timeout(
-        writer,
-        compio::time::sleep(Duration::from_millis(500)),
-    )
-    .await;
+    let done = with_timeout(writer, compio::time::sleep(Duration::from_millis(500))).await;
     assert!(
         matches!(done, Some(Ok(_))),
         "队首读者被取消后，写者必须能被放行"
@@ -162,11 +158,7 @@ async fn upgrade_should_jump_ahead_of_queued_writer() {
 
     drop(w);
     drop(upg_sess);
-    let done = with_timeout(
-        writer,
-        compio::time::sleep(Duration::from_millis(500)),
-    )
-    .await;
+    let done = with_timeout(writer, compio::time::sleep(Duration::from_millis(500))).await;
     assert!(matches!(done, Some(Ok(()))), "可升级读归还后写者应能进入");
     assert!(writer_entered.load(Ordering::SeqCst));
 }
@@ -288,11 +280,7 @@ async fn writer_should_not_starve_while_readers_keep_arriving() {
     }
 
     drop(r);
-    let done = with_timeout(
-        writer,
-        compio::time::sleep(Duration::from_millis(500)),
-    )
-    .await;
+    let done = with_timeout(writer, compio::time::sleep(Duration::from_millis(500))).await;
     assert!(matches!(done, Some(Ok(0))), "既有读者排空后写者必须进入");
 }
 
@@ -375,7 +363,10 @@ async fn cancelled_token_should_abort_acquire_cleanly() {
     let mut sess = lock.acquire_session();
 
     let hold = sess_hold.try_write().unwrap();
-    let r = sess.read_async().may_cancel_with(CancelledToken::new()).await;
+    let r = sess
+        .read_async()
+        .may_cancel_with(CancelledToken::new())
+        .await;
     assert!(matches!(r, Result::Err(CoopRwLockError::Cancelled)));
     drop(r);
 
@@ -487,21 +478,16 @@ async fn timeout_cancelled_wait_should_not_wedge_lock() {
     let mut sess = lock.acquire_session();
 
     let hold = sess_hold.try_write().unwrap();
-    let timed_out =
-        tokio::time::timeout(Duration::from_millis(50), sess.write_async())
-            .await;
+    let timed_out = tokio::time::timeout(Duration::from_millis(50), sess.write_async()).await;
     assert!(timed_out.is_err(), "持锁期间等待写许可应当超时");
     // `Result`/`Option` 里含有带 Drop 的守卫类型，会一直占着会话的借用。
     drop(timed_out);
 
     drop(hold);
-    let got = tokio::time::timeout(
-        Duration::from_millis(500),
-        sess.read_async(),
-    )
-    .await
-    .expect("取消之后锁必须仍然可用")
-    .unwrap();
+    let got = tokio::time::timeout(Duration::from_millis(500), sess.read_async())
+        .await
+        .expect("取消之后锁必须仍然可用")
+        .unwrap();
     assert_eq!(*got, 1);
 }
 
@@ -541,11 +527,7 @@ async fn upgradable_reader_should_promote_under_contention() {
             let mut w = upg_sess.upgrade_async().await.unwrap();
             // 升级成功即独占：此刻不应有其他读者。
             ir_u.fetch_sub(1, Ordering::SeqCst);
-            assert_eq!(
-                ir_u.load(Ordering::SeqCst),
-                0,
-                "升级成功时必须是独占的"
-            );
+            assert_eq!(ir_u.load(Ordering::SeqCst), 0, "升级成功时必须是独占的");
             *w += 1;
             drop(w);
             // 回退为可升级读。

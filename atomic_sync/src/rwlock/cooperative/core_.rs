@@ -30,10 +30,13 @@ use funty::Unsigned;
 
 use atomex::{x_deps::funty, StrictOrderings, TrAtomicData, TrCmpxchOrderings};
 
-use super::{
+use crate::rwlock::{
     state_::CoopRwState,
-    wait_::{SpinLock, WaitKind, WaitNode, WaitQueue},
+    wait_::{SpinLock, WaitKind, WaitNode},
 };
+
+/// 堆分配队列：队首即最先到达的等待者。
+type WaitQueue = VecDeque<Arc<WaitNode>>;
 
 /// 一次获取动作的当前进展。
 pub(super) enum AcqProgress {

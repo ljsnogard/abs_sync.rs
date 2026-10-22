@@ -7,10 +7,7 @@ use core::{borrow::BorrowMut, fmt, marker::PhantomData};
 
 use funty::Unsigned;
 
-use atomex::{
-    x_deps::funty,
-    StrictOrderings, TrAtomicData, TrAtomicFlags, TrCmpxchOrderings,
-};
+use atomex::{StrictOrderings, TrAtomicData, TrAtomicFlags, TrCmpxchOrderings, x_deps::funty};
 
 /// [`CoopRwState`] 的一次性快照，供放行流程做统一判断。
 ///
@@ -59,11 +56,7 @@ pub(super) struct CoopRwStateSnapshot<D> {
 /// 升级得到的写者仍然"代表"那个可升级读槽位，槽位由可升级读守卫自身析构时
 /// 归还。这样升级前后 `UpgradeSession` 的所有权模型不变，
 /// 写者侧也只剩唯一一条释放路径。
-pub(super) struct CoopRwState<D, B, O = StrictOrderings>(
-    B,
-    PhantomData<D>,
-    PhantomData<O>,
-)
+pub(super) struct CoopRwState<D, B, O = StrictOrderings>(B, PhantomData<D>, PhantomData<O>)
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
@@ -85,7 +78,8 @@ where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
-{}
+{
+}
 
 impl<D, B, O> CoopRwState<D, B, O>
 where
@@ -309,11 +303,8 @@ where
     /// 准入条件是"没有写者持有、队列里没有写者/升级等待者"。**队列里只有读者时
     /// 仍然放行**——这正是本策略与严格 FIFO 的差别。
     pub(super) fn try_read_fast(&self) -> bool {
-        self.try_spin_update_(
-            Self::expect_can_read_fast_,
-            Self::desire_inc_reader_,
-        )
-        .is_ok()
+        self.try_spin_update_(Self::expect_can_read_fast_, Self::desire_inc_reader_)
+            .is_ok()
     }
 
     fn expect_can_read_fast_(s: D) -> bool {
@@ -324,11 +315,8 @@ where
 
     /// 尝试以写者身份直接进入；成功时置 `WRITER_ACTIVE`。
     pub(super) fn try_write_fast(&self) -> bool {
-        self.try_spin_update_(
-            Self::expect_can_write_fast_,
-            Self::desire_writer_active_,
-        )
-        .is_ok()
+        self.try_spin_update_(Self::expect_can_write_fast_, Self::desire_writer_active_)
+            .is_ok()
     }
 
     fn expect_can_write_fast_(s: D) -> bool {
@@ -369,11 +357,8 @@ where
     /// 失败（例如可升级读者已挂起升级栅栏）时调用者应退回等待，
     /// 等待下一次放行。
     pub(super) fn try_read_queued(&self) -> bool {
-        self.try_spin_update_(
-            Self::expect_can_read_queued_,
-            Self::desire_inc_reader_,
-        )
-        .is_ok()
+        self.try_spin_update_(Self::expect_can_read_queued_, Self::desire_inc_reader_)
+            .is_ok()
     }
 
     fn expect_can_read_queued_(s: D) -> bool {
@@ -382,11 +367,8 @@ where
 
     /// 已被放行的写者尝试真正进入。
     pub(super) fn try_write_queued(&self) -> bool {
-        self.try_spin_update_(
-            Self::expect_can_write_queued_,
-            Self::desire_writer_active_,
-        )
-        .is_ok()
+        self.try_spin_update_(Self::expect_can_write_queued_, Self::desire_writer_active_)
+            .is_ok()
     }
 
     fn expect_can_write_queued_(s: D) -> bool {
@@ -415,11 +397,8 @@ where
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
     pub(super) fn release_reader(&self) -> bool {
-        self.try_spin_update_(
-            Self::expect_reader_gt_min_,
-            Self::desire_dec_reader_,
-        )
-        .is_ok()
+        self.try_spin_update_(Self::expect_reader_gt_min_, Self::desire_dec_reader_)
+            .is_ok()
     }
 
     pub(super) fn release_upgradable_read(&self) -> bool {
@@ -445,11 +424,8 @@ where
     /// `WRITER_ACTIVE`。升级路径**不**改动读者计数与 `UPGRADE_ACTIVE`，
     /// 那部分留给可升级读守卫自身析构时归还。
     pub(super) fn release_writer(&self) -> bool {
-        self.try_spin_update_(
-            Self::expect_writer_active_,
-            Self::desire_writer_inactive_,
-        )
-        .is_ok()
+        self.try_spin_update_(Self::expect_writer_active_, Self::desire_writer_inactive_)
+            .is_ok()
     }
 
     /// 可升级读者升级为写者。
@@ -463,11 +439,8 @@ where
 
     /// 写者降级为普通读者。
     pub(super) fn downgrade_write_to_read(&self) -> bool {
-        self.try_spin_update_(
-            Self::expect_writer_active_,
-            Self::desire_write_to_read_,
-        )
-        .is_ok()
+        self.try_spin_update_(Self::expect_writer_active_, Self::desire_write_to_read_)
+            .is_ok()
     }
 
     fn desire_write_to_read_(s: D) -> D {
@@ -621,7 +594,10 @@ mod tests_ {
 
         assert!(st.clear_waiters_present());
         assert!(!st.waiters_present());
-        assert!(st.writer_queued(), "清除 WAITERS_PRESENT 不应影响 WRITER_QUEUED");
+        assert!(
+            st.writer_queued(),
+            "清除 WAITERS_PRESENT 不应影响 WRITER_QUEUED"
+        );
         assert_eq!(st.reader_count(), 0);
         assert!(!st.try_read_fast());
 

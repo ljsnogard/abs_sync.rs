@@ -23,11 +23,11 @@ use abs_sync::{
 use crate::rwlock::TrShareMut;
 
 use super::{
-    core_::AcqProgress,
-    error_::CoopRwLockError,
-    reader_::ReaderGuard,
-    rwlock_::CooperativeAcqSession,
+    core_::AcqProgress, reader_::ReaderGuard, rwlock_::CooperativeAcqSession,
     upgrade_::UpgradableReaderGuard,
+};
+use crate::rwlock::{
+    error_::CoopRwLockError,
     wait_::{WaitKind, WaitNode},
 };
 
