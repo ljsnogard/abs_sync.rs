@@ -44,8 +44,15 @@ use crate::rwlock::wait_::WaitKind;
 
 /// 可升级读持锁标记在 [`RootRead::state_`] 中的位置。
 const UPGR_BIT: usize = 1 << (usize::BITS - 1);
-/// 读者计数掩码。
-const COUNT_MASK: usize = !UPGR_BIT;
+/// 读者链被唯一唤醒者独占的标记。
+///
+/// 这把“锁”保护的是**链拓扑**（`tail_` 与每个节点的 `prev_`）以及节点
+/// 生命期，不保护节点状态：`Waiting`/`Cancelled`/`Admitted` 仍由各节点的
+/// 原子状态机并发推进。持有者可以锁外遍历整条链并逐个 `wake`；其他人
+/// （新读者入队、`prune_front_`、另一个唤醒者）看到该位必须退让。
+const WAKING_BIT: usize = 1 << (usize::BITS - 2);
+/// 读者计数掩码（排除 `UPGR` 与 `WAKING` 两个标志位）。
+const COUNT_MASK: usize = !(UPGR_BIT | WAKING_BIT);
 
 /// 读者正在写 waker。
 pub(super) const READER_REGISTERING: u8 = 0;
@@ -260,11 +267,23 @@ impl RootRead {
     }
 
     /// 放行/领取一个读者时加一。
+    ///
+    /// 计数只在 `COUNT_MASK` 低位内递增。全局读者上限由 `CoopRwState` 的
+    /// `expect_reader_lt_max_` 限制为 `D::MAX >> 4`，远小于 `WAKING_BIT`，
+    /// 因此 `value + 1` 不会进位到 `WAKING`/`UPGR` 位。这里用 debug 断言
+    /// 固定该前提，避免将来放宽上限时静默破坏标志位。
     #[inline]
     pub(super) fn inc_count_(&self) {
-        let _ = self
-            .state_
-            .try_spin_compare_exchange_weak(|_| true, |value| value + 1);
+        let _ = self.state_.try_spin_compare_exchange_weak(
+            |_| true,
+            |value| {
+                debug_assert!(
+                    value & COUNT_MASK != COUNT_MASK,
+                    "RootRead count_ 溢出到 WAKING/UPGR 位"
+                );
+                value + 1
+            },
+        );
     }
 
     /// 释放/取消一个已放行读者时减一；返回减一前的计数。
@@ -280,6 +299,36 @@ impl RootRead {
                 other.into_inner() & COUNT_MASK
             }
         }
+    }
+
+    /// 读者链是否正被唯一唤醒者独占（拓扑锁）。
+    #[inline]
+    pub(super) fn waking_(&self) -> bool {
+        self.state_.value() & WAKING_BIT != 0
+    }
+
+    /// 尝试把 `WAKING` 从 0 置 1；成功者成为唯一唤醒者。
+    ///
+    /// 只在持有队列锁时调用。失败说明另一个唤醒者已经占住链，调用方应当
+    /// 直接退出本次 `pass`：持有者结束遍历后会重新推进队列。
+    #[inline]
+    pub(super) fn try_set_waking_(&self) -> bool {
+        matches!(
+            self.state_.try_spin_compare_exchange_weak(
+                |value| value & WAKING_BIT == 0,
+                |value| value | WAKING_BIT,
+            ),
+            CmpxchResult::Succ(_)
+        )
+    }
+
+    /// 清除 `WAKING`。只有当前唯一唤醒者在遍历结束后可以调用。
+    #[inline]
+    pub(super) fn clear_waking_(&self) {
+        let _ = self.state_.try_spin_compare_exchange_weak(
+            |value| value & WAKING_BIT != 0,
+            |value| value & !WAKING_BIT,
+        );
     }
 
     /// 当前是否有已领取的可升级读持锁者。
@@ -319,11 +368,16 @@ impl RootRead {
 
     /// 把读者节点压入组尾（原子 CAS）。
     ///
+    /// `WAKING` 是链拓扑的独占锁：持有者正在锁外遍历。调用方必须先确认
+    /// `!waking_()`；否则应当新建一个读者组，而不是修改当前链
+    /// （`enqueue_reader_` 就是这样选择的）。
+    ///
     /// # Safety
     ///
     /// - `node` 必须是刚分配、尚未发布到任何链表的读者节点；
-    /// - 遍历者必须持有队列锁，保证发布后 `prev_` 链可安全读取。
+    /// - 调用方必须持有队列锁，且本组当前 `!waking_()`。
     pub(super) unsafe fn push_reader_(&self, node: NonNull<WaitNode>) {
+        debug_assert!(!self.waking_(), "push_reader_: 读者链正被唤醒者独占");
         let _ = self.tail_.try_spin_compare_exchange_weak(
             |_| true,
             |current| {

@@ -17,7 +17,9 @@ HEAD：`c2ae429`（本次只新增基准设施与文档，未改核心实现）
    Arena 4.39 ms vs 堆版 105 µs（**慢 41.7 倍**）。原因是 `WAKE_BATCH=32`
    且每批都从链尾重扫已放行节点，复杂度 O(N²/32)。**这是本次最明确的
    可修问题**：把 `WAKE_BATCH` 调到 128/256 后，N=4096 的 release 降到
-   1.14 ms / 0.66 ms（见 §7）。
+   1.14 ms / 0.66 ms（见 §7）。该问题随后已用 **WAKING 独占读者链 + 锁外
+   整链遍历** 修复（4.39 ms → 166 µs），见
+   [rwlock-arena-waking-20261023-0400.md](rwlock-arena-waking-20261023-0400.md)。
 3. **“Arena 多读者释放占优”的预测不成立**：单线程顺序释放 Arena 慢
    1.5～3.3 倍（N=1 3.3×、N≥16 2.1×），4 个 OS 线程同时释放仍慢
    1.55～2.6 倍。Arena 每次 `release_reader` 要做两次原子 RMW，最后一个
@@ -388,6 +390,9 @@ compio 单线程的 10% 差异接近噪声。OS 线程 `block_on` 一节按计�
   `WAKE_BATCH` 是低风险缓解，游标才是根治。
 - 建议先提交 `WAKE_BATCH = 128`（一行常量、可单独验证），再把游标作为
   后续优化单独评审。
+- **后续实际采用方案**：用 `WAKING` 位独占读者链并锁外整链遍历，删除
+  `WAKE_BATCH`/`WakerBatch`；上面的 128/256 调参数据保留为历史对照，见
+  [rwlock-arena-waking-20261023-0400.md](rwlock-arena-waking-20261023-0400.md)。
 
 ### 13.2 `RootRead` 计数：不建议优先改
 
@@ -453,8 +458,9 @@ compio 单线程的 10% 差异接近噪声。OS 线程 `block_on` 一节按计�
 
 ## 15. 下一步
 
-1. **（高优先）** 把 `WAKE_BATCH` 调到 128，并实现读者链放行游标，消除
-   `release` 阶段的 O(N²/B)；目标：N=4096 release 进入 100～200 µs 量级。
+1. ~~把 `WAKE_BATCH` 调到 128，并实现读者链放行游标~~ —— 已由
+   [rwlock-arena-waking-20261023-0400.md](rwlock-arena-waking-20261023-0400.md)
+   的 WAKING 锁外整链遍历完成；N=4096 release 实测 166 µs。
 2. **（高优先）** 评估 reader-release：如果真实负载以“读者逐个释放”为主，
    需要权衡 Arena 的批量回收；可考虑延迟回收（把空组挂到待回收链，释放
    路径只 dec_count，下一次 pass 批量归还），或把 `active_group_` 读取与

@@ -39,9 +39,6 @@ use super::{
     },
 };
 
-/// 每批最多在锁外唤醒的 waker 数。
-const WAKE_BATCH: usize = 32;
-
 /// 等待中 future 持有的句柄：一个 `WaitNode` 元素。
 #[derive(Clone, Copy)]
 pub(super) struct PendingWait {
@@ -88,42 +85,14 @@ enum Selection {
     Write(NonNull<WaitNode>),
 }
 
-/// 一批待锁外唤醒的 waker。
-struct WakerBatch {
-    wakers_: [Option<Waker>; WAKE_BATCH],
-    len_: usize,
-}
-
-impl WakerBatch {
-    fn new() -> Self {
-        WakerBatch {
-            wakers_: core::array::from_fn(|_| Option::None),
-            len_: 0,
-        }
-    }
-
-    fn is_full(&self) -> bool {
-        self.len_ >= WAKE_BATCH
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len_ == 0
-    }
-
-    fn push(&mut self, waker: Waker) {
-        debug_assert!(!self.is_full(), "WakerBatch 已满");
-        self.wakers_[self.len_] = Option::Some(waker);
-        self.len_ += 1;
-    }
-
-    fn wake_all(&mut self) {
-        for slot in &mut self.wakers_[..self.len_] {
-            if let Some(waker) = slot.take() {
-                waker.wake();
-            }
-        }
-        self.len_ = 0;
-    }
+/// `run_pass_` 一轮在锁外要执行的动作。
+enum WakeAction {
+    /// 没有可放行的目标。
+    Stop,
+    /// 锁外遍历一条读者链；`WAKING` 已由 `select_head_` 置位。
+    Group(NonNull<WaitNode>),
+    /// 写者 waker 已在锁内取走，锁外只调用 `wake`；`None` 表示状态已变化。
+    Write(Option<Waker>),
 }
 
 /// Arena 版读写锁的共享内核。
@@ -471,11 +440,17 @@ where
             let tail_node = unsafe { tail.as_ref() };
             if tail_node.is_root_read_() {
                 let root = tail_node.as_root_read_();
-                // 主队列尾是 RootRead 才允许追加；一条链最多一个 UpgrRead，
-                // 普通 Read 可以排在它后面。
-                let can_join = kind == WaitKind::Read
-                    // SAFETY: 持有队列锁。
-                    || !unsafe { root.has_upgr_read_() };
+                // 入队先决条件：目标读者链没有被唯一唤醒者独占（WAKING=0）。
+                // 若已独占，绝不修改该链，而是新建一个组排到主队列尾；这样
+                // 唤醒者遍历的旧链保持静止，新读者也不会被漏掉（新组会在
+                // 后续 pass 中被选中）。
+                //
+                // 另外，主队列尾是 RootRead 才允许追加；一条链最多一个
+                // UpgrRead，普通 Read 可以排在它后面。
+                let can_join = !root.waking_()
+                    && (kind == WaitKind::Read
+                        // SAFETY: 持有队列锁，且 WAKING=0 保证链拓扑静止。
+                        || !unsafe { root.has_upgr_read_() });
                 if can_join {
                     let reader = self.alloc_node_(q, WaitNode::new_reader(kind, tail));
                     // SAFETY: 持有队列锁，且 `reader` 刚分配。
@@ -624,7 +599,13 @@ where
             let node = unsafe { front.as_ref() };
             if node.is_root_read_() {
                 let root = node.as_root_read_();
-                // SAFETY: 持有队列锁。
+                // `WAKING` 是读者链拓扑的独占锁：持有者正在锁外遍历整条链。
+                // 此时既不能回收该组（节点生命期由遍历者使用），也不能越过
+                // 它去处理后面的节点，否则“队首正在被处理”的前提就破了。
+                if root.waking_() {
+                    return;
+                }
+                // SAFETY: 持有队列锁，且链拓扑静止。
                 if root.count_() == 0 && !unsafe { root.has_pending_() } {
                     debug_assert!(!root.upgr_active_(), "空读者组仍带有可升级读持锁标记");
                     self.free_group_(q, front);
@@ -663,9 +644,20 @@ where
         let node = unsafe { front.as_ref() };
         if node.is_root_read_() {
             let root = node.as_root_read_();
-            // SAFETY: 持有队列锁。
+            // 已有唯一唤醒者在锁外遍历：本次 pass 直接退出，由该唤醒者在
+            // 结束时重新推进队列。不要在此时再选同一个组，否则会出现两个
+            // 遍历者同时清 `WAKING`。
+            if root.waking_() {
+                return Option::None;
+            }
+            // SAFETY: 持有队列锁，且链拓扑静止。
             if unsafe { root.has_pending_() } {
-                return Option::Some(Selection::Group(front));
+                // 先占住读者链拓扑，再在锁外遍历。CAS 失败只可能来自并发的
+                // `clear_waking_` 之后被另一个唤醒者抢先；让后者负责推进。
+                if root.try_set_waking_() {
+                    return Option::Some(Selection::Group(front));
+                }
+                return Option::None;
             }
             if root.count_() == 1 && root.upgr_active_() {
                 // SAFETY: 持有队列锁。
@@ -705,73 +697,95 @@ where
         }
     }
 
-    /// 在队列锁内放行一批读者；返回锁外要唤醒的 waker。
-    fn admit_group_batch_(&self, group: NonNull<WaitNode>) -> WakerBatch {
-        // SAFETY: `group` 是 select_head_ 选中的存活读者组。
+    /// 锁外遍历整条读者链并逐个唤醒；返回本轮成功放行的读者数。
+    ///
+    /// 调用前 `select_head_` 已把 `WAKING` 置 1，因此本函数独占链拓扑：
+    ///
+    /// - 新读者不会再压入本组：`enqueue_reader_` 看到 `WAKING` 会新建组，
+    ///   所以 `tail_` 与所有 `prev_` 在整个遍历期间完全静止；
+    /// - `prune_front_` 看到 `WAKING` 不会回收本组，节点生命期覆盖遍历全程；
+    /// - 只有本函数在结束时清除 `WAKING`；其他 `pass` 看到它只会直接返回。
+    ///
+    /// 返回 0 表示链上只剩 `Registering`/`Taking` 或当前不可放行的
+    /// `UpgrRead`：调用方应退出，让对应节点的所有者自行触发下一次 pass，
+    /// 避免在这里忙循环。
+    fn wake_group_(&self, group: NonNull<WaitNode>) -> usize {
+        // SAFETY: `group` 是 select_head_ 选中的存活读者组；WAKING 保证它在
+        // 本函数返回前不会被回收，且链拓扑不会改变。
         let root = unsafe { group.as_ref() }.as_root_read_();
-        let mut batch = WakerBatch::new();
         let snap = self.stat_.snapshot();
-        // SAFETY: 持有队列锁；读者链尾指针与 prev_ 链稳定。
+        let mut admitted = 0usize;
+        // SAFETY: 遍历期间链静止；节点由 WAKING 保护，不会释放。
         let mut cur = unsafe { root.tail_() };
         while let Option::Some(node) = cur {
-            if batch.is_full() {
-                break;
-            }
-            // SAFETY: 链节点在组存活期间有效；持有队列锁。
-            let node_ref = unsafe { node.as_ref() };
             // SAFETY: 同上。
+            let node_ref = unsafe { node.as_ref() };
             let prev = unsafe { node_ref.prev_() };
             let skip = node_ref.is_upgr_read_() && snap.upgrade_active;
             if !skip && let Option::Some(waker) = node_ref.as_reader_().try_admit_() {
                 root.inc_count_();
-                batch.push(waker);
+                // 锁外唤醒：wake 可能同步重入执行器，但重入的 pass 看到
+                // WAKING 会直接返回，不会再次进入本链。
+                waker.wake();
+                admitted += 1;
             }
             cur = prev;
         }
-        batch
+        root.clear_waking_();
+        admitted
     }
 
-    fn wake_selection_(&self, selection: Selection) -> WakerBatch {
-        match selection {
-            Selection::Group(group) => self.admit_group_batch_(group),
-            Selection::Write(node) => {
-                let mut batch = WakerBatch::new();
-                // SAFETY: `node` 是 select_head_ 选中的存活节点。
-                let write = unsafe { node.as_ref() }.as_write_();
-                if write.state_() == SLOT_WAITING
-                    // SAFETY: 持有队列锁。
-                    && let Option::Some(waker) = unsafe { write.take_waker_() }
-                {
-                    // SAFETY: 持有队列锁。
-                    unsafe { write.set_state_(SLOT_ADMITTED) };
-                    batch.push(waker);
-                }
-                batch
-            }
+    /// 锁内取走一个写者的 waker 并标 `Admitted`。
+    ///
+    /// 写者最多只放行一个，不涉及读者链拓扑，因此不需要 `WAKING`。
+    fn take_write_waker_(node: NonNull<WaitNode>) -> Option<Waker> {
+        // SAFETY: `node` 是 select_head_ 选中的存活写者节点；持有队列锁。
+        let write = unsafe { node.as_ref() }.as_write_();
+        if write.state_() != SLOT_WAITING {
+            return Option::None;
         }
+        // SAFETY: 持有队列锁。
+        let waker = unsafe { write.take_waker_() };
+        if waker.is_some() {
+            // SAFETY: 持有队列锁。
+            unsafe { write.set_state_(SLOT_ADMITTED) };
+        }
+        waker
     }
 
-    /// 推进放行流程；锁外唤醒每一批 waker。
+    /// 推进放行流程。
+    ///
+    /// 读者组在锁外整链遍历（`wake_group_`）；写者仍只在锁内取一个 waker。
+    /// 每轮结束后重新选队首，以处理遍历期间发生的入队、取消与写者释放。
     fn run_pass_(&self) {
         if !self.stat_.waiters_present() {
             return;
         }
         loop {
-            let mut batch = {
+            let action = {
                 let mut q = self.queue_.lock();
                 self.prune_front_(&mut q);
                 match self.select_head_(&mut q) {
-                    Option::None => break,
-                    Option::Some(selection) => {
-                        // `wake_selection_` 只做状态迁移与取 waker，不调用 wake。
-                        self.wake_selection_(selection)
+                    Option::None => WakeAction::Stop,
+                    Option::Some(Selection::Group(group)) => WakeAction::Group(group),
+                    Option::Some(Selection::Write(node)) => {
+                        WakeAction::Write(Self::take_write_waker_(node))
                     }
                 }
             };
-            if batch.is_empty() {
-                break;
+            match action {
+                WakeAction::Stop => break,
+                WakeAction::Write(Option::None) => break,
+                WakeAction::Write(Option::Some(waker)) => waker.wake(),
+                WakeAction::Group(group) => {
+                    let admitted = self.wake_group_(group);
+                    if admitted == 0 {
+                        // 链上只剩暂不可放行的节点；它们的所有者会自行触发
+                        // 下一次 pass，这里退出以避免忙循环。
+                        break;
+                    }
+                }
             }
-            batch.wake_all();
         }
     }
 
@@ -1027,6 +1041,69 @@ mod tests_ {
     use core::{sync::atomic::AtomicUsize, task::Waker};
 
     use super::{AcqProgress, RwCoreArena, WaitKind};
+
+    /// 验证 `WAKING` 是读者链拓扑的独占锁：置位期间新读者不得加入该链，
+    /// 空组也不得被 `prune_front_` 回收；清除后队列恢复推进。
+    ///
+    /// Verifies the `WAKING` bit is an exclusive lock over reader-chain
+    /// topology: while set, new readers must not join the chain and an empty
+    /// group must not be pruned; clearing it resumes queue progress.
+    ///
+    /// - 手段：写者持有期间排队读者 A，置位其组的 `WAKING`；再排队读者 B，
+    ///   断言 B 落在新组；取消 A 使原组 `count == 0` 且无 pending，此时跑
+    ///   pass 断言原组未被回收；清除 `WAKING` 后再跑 pass，原组被回收。
+    /// - 判断：B 的组指针与 A 不同；置位期间 head 仍是 A 的组且节点池非空；
+    ///   清除后 head 变为 B 的组，释放写者后 B 能正常领取。
+    #[test]
+    fn waking_group_is_exclusive_for_enqueue_and_prune() {
+        let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
+        assert!(core.try_write_fast(), "写者快速路径应成功");
+
+        let waker = Waker::noop();
+        let AcqProgress::Waiting(pending_a) = core.acquire(WaitKind::Read, waker) else {
+            panic!("写者持有时读者 A 不应直接领取");
+        };
+        // SAFETY: A 的节点仍在队列中，组根有效。
+        let group_a = unsafe { pending_a.node_.as_ref() }.as_reader_().root_();
+        // SAFETY: 组 A 仍存活。
+        assert!(
+            unsafe { group_a.as_ref() }.as_root_read_().try_set_waking_(),
+            "首次置位 WAKING 应成功"
+        );
+
+        // WAKING 期间新读者必须新建组，不能压入 A 的链。
+        let AcqProgress::Waiting(pending_b) = core.acquire(WaitKind::Read, waker) else {
+            panic!("写者持有时读者 B 不应直接领取");
+        };
+        // SAFETY: B 的节点仍在队列中。
+        let group_b = unsafe { pending_b.node_.as_ref() }.as_reader_().root_();
+        assert_ne!(group_b, group_a, "WAKING 期间新读者应加入新组");
+
+        // 取消 A：原组变为 count=0 且无 pending，但 WAKING 阻止回收。
+        core.cancel_wait(&pending_a);
+        assert_eq!(
+            core.queue_.lock().head_,
+            Some(group_a),
+            "WAKING 期间原组不得被 prune 回收"
+        );
+        assert!(!core.pool_is_empty(), "WAKING 期间节点不得被归还");
+
+        // 清除 WAKING 后，原组应被回收，head 推进到 B 的组。
+        // SAFETY: 组 A 仍存活（WAKING 刚由本测试清除）。
+        unsafe { group_a.as_ref() }.as_root_read_().clear_waking_();
+        core.run_pass_();
+        assert_eq!(
+            core.queue_.lock().head_,
+            Some(group_b),
+            "清除 WAKING 后空组应被回收"
+        );
+
+        core.release_writer();
+        assert!(core.poll_acquire(&pending_b, waker), "释放写者后 B 应能领取");
+        core.release_reader(true);
+        assert!(!core.waiters_present(), "最终队列应为空");
+        assert!(core.pool_is_empty(), "最终 Arena 应为空");
+    }
 
     /// 验证写者持有期间读者的入队、放行与领取流程。
     ///
