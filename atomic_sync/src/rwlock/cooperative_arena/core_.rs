@@ -8,14 +8,15 @@
 //! 读者链（next_ 单链）:     PureRead ──> PureRead ──> UpgrRead（至多一个）
 //! ```
 //!
-//! - 队列锁只保护主队列拓扑、读者组封口标记与升级预留节点；
-//! - 读者领取通过状态字 CAS 完成，成功后在读者链节点上原子累加
-//!   `RootRead.count_`，不取队列锁；
-//! - 读者释放只做 `count_.fetch_sub`：减到 1 且组内有已领取的 `UpgrRead`
-//!   时预分配一个休眠升级写节点；减到 0 时由最后一个读者取一次队列锁，
-//!   把整条读者链批量归还 Arena；
-//! - 主队列中的活跃 `RootRead` 一直保留到 `count_ == 0`，因此升级节点可以
-//!   直接排在它后面，作为下一个待激活写者。
+//! # 同步模型
+//!
+//! - 队列锁保护主队列、读者链、节点状态与 waker；不再为每个节点加锁。
+//! - 唤醒时在队列锁内把一批读者标成 `Admitted` 并取出 waker，释放锁后再
+//!   `wake`；下一轮重新从队首选择，继续下一批。
+//! - `RootRead` 的单个原子同时保存持锁计数与可升级读标记；读者释放/取消
+//!   只做原子减一，最后一个减到 0 的线程触发 `run_pass_`，由队首 prune
+//!   统一回收空组。
+//! - 升级请求只有在真正发起时才插入 `PureWrite(Upgrade)`；不做预留。
 
 use alloc::alloc::{Global, handle_alloc_error};
 use core::{
@@ -39,6 +40,9 @@ use super::{
     wait_node_::{SlotState, WaitNode},
 };
 
+/// 每批最多在锁外唤醒的 waker 数。
+const WAKE_BATCH: usize = 32;
+
 /// 等待中 future 持有的句柄：一个 `WaitNode` 元素。
 #[derive(Clone, Copy)]
 pub(super) struct PendingWait {
@@ -47,7 +51,7 @@ pub(super) struct PendingWait {
 }
 
 // SAFETY: 句柄只保存一个 Arena 元素的地址。元素由 Arena 持有，地址在存活期间
-// 稳定；所有解引用都发生在队列/节点锁内，移动句柄本身不会产生别名访问。
+// 稳定；所有解引用都发生在队列锁内，移动句柄本身不会产生别名访问。
 unsafe impl Send for PendingWait {}
 // SAFETY: 同上；共享 `&PendingWait` 只读取地址与 kind，不提供可变访问。
 unsafe impl Sync for PendingWait {}
@@ -66,10 +70,8 @@ struct QueuePayload {
     head_: Option<NonNull<WaitNode>>,
     /// 主队列队尾。
     tail_: Option<NonNull<WaitNode>>,
-    /// 队列中仍处于待决状态、且已计入计数的 `Write` / `Upgrade` 请求数。
+    /// 队列中仍处于待决状态的 `Write` / `Upgrade` 请求数。
     writer_waiters_: usize,
-    /// 有线程发现读者组正在被别的唤醒者处理，需要唤醒者在清标记后重跑。
-    retry_: bool,
     /// 等待节点池。
     arena_: Arena<WaitNode>,
 }
@@ -85,6 +87,44 @@ enum Selection {
     Group(NonNull<WaitNode>),
     /// 唤醒一个独占等待者。
     Write(NonNull<WaitNode>),
+}
+
+/// 一批待锁外唤醒的 waker。
+struct WakerBatch {
+    wakers_: [Option<Waker>; WAKE_BATCH],
+    len_: usize,
+}
+
+impl WakerBatch {
+    fn new() -> Self {
+        WakerBatch {
+            wakers_: core::array::from_fn(|_| Option::None),
+            len_: 0,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.len_ >= WAKE_BATCH
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len_ == 0
+    }
+
+    fn push(&mut self, waker: Waker) {
+        debug_assert!(!self.is_full(), "WakerBatch 已满");
+        self.wakers_[self.len_] = Option::Some(waker);
+        self.len_ += 1;
+    }
+
+    fn wake_all(&mut self) {
+        for slot in &mut self.wakers_[..self.len_] {
+            if let Some(waker) = slot.take() {
+                waker.wake();
+            }
+        }
+        self.len_ = 0;
+    }
 }
 
 /// Arena 版读写锁的共享内核。
@@ -114,7 +154,6 @@ where
                 head_: Option::None,
                 tail_: Option::None,
                 writer_waiters_: 0,
-                retry_: false,
                 arena_: Arena::new(Global),
             }),
         }
@@ -144,21 +183,6 @@ where
     #[inline]
     pub(super) fn pool_is_empty(&self) -> bool {
         self.queue_.lock().arena_.is_empty()
-    }
-
-    /// 活跃组是否持有一个休眠的升级占位节点（仅供单元测试观测）。
-    #[cfg(test)]
-    pub(super) fn has_reserved_upgrade(&self) -> bool {
-        let Option::Some(group) = self.active_group_() else {
-            return false;
-        };
-        let _q = self.queue_.lock();
-        // SAFETY: 持有队列锁；活跃组不会在 `count_ > 0` 期间回收。
-        let state = unsafe { group.as_ref().as_root_read_().state_() };
-        state.upgrade_.is_some_and(|node| {
-            // SAFETY: `node` 是本组的升级预留节点，仍然存活。
-            unsafe { node.as_ref() }.as_write_().state_() == SlotState::Reserved
-        })
     }
 
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -205,28 +229,26 @@ where
 
     /// 发起升级；`tracked` 表示请求者来自队列放行的读者组。
     pub(super) fn acquire_upgrade(&self, waker: &Waker, tracked: bool) -> AcqProgress {
-        if tracked {
-            let group = self.active_group_();
-            debug_assert!(group.is_some(), "tracked 升级请求缺少活跃读者组");
-            // 组存在时把升级节点排在组后继；组缺失时退回队首路径。
-            if let Option::Some(group) = group {
-                return self.acquire_upgrade_in_group_(group, waker);
-            }
-        }
-        self.acquire_inner_(WaitKind::Upgrade, waker)
-    }
-
-    fn acquire_upgrade_in_group_(&self, group: NonNull<WaitNode>, waker: &Waker) -> AcqProgress {
         let (claimed, pending) = {
             let mut q = self.queue_.lock();
             self.prune_front_(&mut q);
-            let pending = self.enqueue_upgrade_in_group_(&mut q, group);
+            let pending = if tracked {
+                match self.active_group_() {
+                    Option::Some(group) => self.enqueue_upgrade_in_group_(&mut q, group),
+                    Option::None => {
+                        debug_assert!(false, "tracked 升级请求缺少活跃读者组");
+                        self.enqueue_upgrade_front_(&mut q)
+                    }
+                }
+            } else {
+                self.enqueue_upgrade_front_(&mut q)
+            };
             if !self.stat_.waiters_present() {
                 self.stat_.mark_waiters_present();
             }
             let claimed = self.try_claim_enqueued_(&mut q, &pending);
             if !claimed {
-                self.register_waker_(&mut q, &pending, waker);
+                self.register_waker_(&pending, waker);
             }
             (claimed, pending)
         };
@@ -248,7 +270,7 @@ where
             }
             let claimed = self.try_claim_enqueued_(&mut q, &pending);
             if !claimed {
-                self.register_waker_(&mut q, &pending, waker);
+                self.register_waker_(&pending, waker);
             }
             (claimed, pending)
         };
@@ -262,62 +284,117 @@ where
 
     /// 已被唤醒的等待者重试领取。
     pub(super) fn poll_acquire(&self, pending: &PendingWait, waker: &Waker) -> bool {
+        let mut q = self.queue_.lock();
         // SAFETY: 句柄对应的节点仍处于待决状态，元素一定还没有被回收。
         let node = unsafe { pending.node_.as_ref() };
-        let state = self.slot_state_(node);
+        let state = self.node_state_(node);
 
         if state == SlotState::Admitted {
             if self.try_claim_(pending.kind_) {
                 if node.is_reader_() {
-                    self.set_active_group_(node.as_reader_().root_());
+                    let reader = node.as_reader_();
+                    if pending.kind_ == WaitKind::UpgradableRead {
+                        // SAFETY: 活跃组在读者计数归零前不会回收。
+                        unsafe { reader.root_().as_ref() }
+                            .as_root_read_()
+                            .set_upgr_active_();
+                    }
+                    self.set_active_group_(reader.root_());
+                    // SAFETY: 持有队列锁。
+                    unsafe { reader.set_state_(SlotState::Acquired) };
+                } else {
+                    let write = node.as_write_();
+                    // SAFETY: 持有队列锁。
+                    unsafe { write.set_state_(SlotState::Acquired) };
+                    self.finish_write_node_(&mut q, pending.node_);
                 }
-                if self.claim_node_(node, pending.kind_).is_some() {
-                    self.finish_claimed_(pending.kind_, pending.node_);
-                    return true;
-                }
-                debug_assert!(false, "状态字领取成功但节点状态已不是待决");
+                drop(q);
+                return true;
             }
-        } else if state == SlotState::Reserved {
-            // 升级预留节点被升级 future 接管。
-            let mut q = self.queue_.lock();
-            let write = node.as_write_();
-            let was_reserved = write.adopt_(waker);
-            if was_reserved {
-                self.note_exclusive_queued_(&mut q);
-                write.set_counted_(true);
+
+            // 状态字竞争失败：回到 Waiting；已计入的读者计数要减一。
+            if node.is_reader_() {
+                let reader = node.as_reader_();
+                // SAFETY: 持有队列锁。
+                unsafe {
+                    reader.set_state_(SlotState::Waiting);
+                    reader.set_waker_(waker);
+                }
+                // SAFETY: 组仍存活；`root_` 有效。
+                unsafe { reader.root_().as_ref() }
+                    .as_root_read_()
+                    .dec_count_();
+            } else {
+                let write = node.as_write_();
+                // SAFETY: 持有队列锁。
+                unsafe {
+                    write.set_state_(SlotState::Waiting);
+                    write.set_waker_(waker);
+                }
             }
             drop(q);
-        } else if state != SlotState::Waiting {
-            debug_assert!(false, "poll_acquire: 在 Acquired/Cancelled 状态上再次 poll");
+            self.run_pass_();
             return false;
         }
 
-        {
-            let mut q = self.queue_.lock();
-            self.register_waker_(&mut q, pending, waker);
+        if state == SlotState::Waiting {
+            self.register_waker_(pending, waker);
+            drop(q);
+            self.run_pass_();
+            return false;
         }
-        self.run_pass_();
+
+        debug_assert!(false, "poll_acquire: 在 Acquired/Cancelled 状态上再次 poll");
         false
     }
 
     /// 等待者被取消（future 被丢弃）。
     pub(super) fn cancel_wait(&self, pending: &PendingWait) {
+        let mut q = self.queue_.lock();
         // SAFETY: 句柄对应的节点仍处于待决状态，元素一定还没有被回收。
         let node = unsafe { pending.node_.as_ref() };
+
         if node.is_reader_() {
-            let old = node.as_reader_().cancel_();
-            debug_assert!(old != SlotState::Acquired, "取消已经领取的读者");
-            // 读者组只在队首由 `prune_front_` 批量回收，避免释放路径与
-            // 取消路径并发地对同一个组调用回收。
+            let reader = node.as_reader_();
+            let old = reader.state_();
+            match old {
+                SlotState::Waiting => {
+                    // SAFETY: 持有队列锁。
+                    unsafe {
+                        reader.set_state_(SlotState::Cancelled);
+                        reader.clear_waker_();
+                    }
+                }
+                SlotState::Admitted => {
+                    // 已放行但还没领取：标记取消并直接减计数，唤醒遍历会跳过。
+                    // SAFETY: 持有队列锁。
+                    unsafe {
+                        reader.set_state_(SlotState::Cancelled);
+                        reader.clear_waker_();
+                    }
+                    // SAFETY: 组仍存活；`root_` 有效。
+                    unsafe { reader.root_().as_ref() }
+                        .as_root_read_()
+                        .dec_count_();
+                }
+                _ => debug_assert!(false, "取消已经领取的读者"),
+            }
+            drop(q);
             self.run_pass_();
             return;
         }
 
         let write = node.as_write_();
-        let old = write.cancel_();
+        let old = write.state_();
         debug_assert!(old != SlotState::Acquired, "取消已经领取的写者");
-        let mut q = self.queue_.lock();
-        self.finish_write_node_(&mut q, pending.node_);
+        if matches!(old, SlotState::Waiting | SlotState::Admitted) {
+            // SAFETY: 持有队列锁。
+            unsafe {
+                write.set_state_(SlotState::Cancelled);
+                write.clear_waker_();
+            }
+            self.finish_write_node_(&mut q, pending.node_);
+        }
         drop(q);
         self.run_pass_();
     }
@@ -342,18 +419,15 @@ where
             let tail_node = unsafe { tail.as_ref() };
             if tail_node.is_root_read_() {
                 let root = tail_node.as_root_read_();
-                // SAFETY: 持有队列锁。
-                let state = unsafe { root.state_() };
-                // SAFETY: 持有队列锁；链节点在组存活期间有效。
-                let has_upgr = unsafe { state.has_upgr_read_() };
-                let can_join = !state.sealed_ && (kind == WaitKind::Read || !has_upgr);
+                // 主队列尾是 RootRead 才允许追加；一条链最多一个 UpgrRead，
+                // 普通 Read 可以排在它后面。
+                let can_join = kind == WaitKind::Read
+                    // SAFETY: 持有队列锁。
+                    || !unsafe { root.has_upgr_read_() };
                 if can_join {
                     let reader = self.alloc_node_(q, WaitNode::new_reader(kind, tail));
                     // SAFETY: 持有队列锁，且 `reader` 刚分配。
-                    unsafe { state.push_reader_(reader) };
-                    if kind == WaitKind::UpgradableRead {
-                        state.sealed_ = true;
-                    }
+                    unsafe { root.push_reader_(reader) };
                     return PendingWait {
                         node_: reader,
                         kind_: kind,
@@ -364,14 +438,9 @@ where
 
         let group = self.alloc_node_(q, WaitNode::new_root_read());
         self.push_back_(q, group);
-        // SAFETY: 持有队列锁；`group` 刚插入主队列。
-        let state = unsafe { group.as_ref().as_root_read_().state_() };
         let reader = self.alloc_node_(q, WaitNode::new_reader(kind, group));
-        // SAFETY: 持有队列锁。
-        unsafe { state.push_reader_(reader) };
-        if kind == WaitKind::UpgradableRead {
-            state.sealed_ = true;
-        }
+        // SAFETY: 持有队列锁；`group` 刚插入主队列。
+        unsafe { group.as_ref().as_root_read_().push_reader_(reader) };
         PendingWait {
             node_: reader,
             kind_: kind,
@@ -379,19 +448,11 @@ where
     }
 
     fn enqueue_write_(&self, q: &mut QueuePayload) -> PendingWait {
-        if let Option::Some(tail) = q.tail_ {
-            // SAFETY: `tail` 是本队列中仍然存活的节点。
-            let tail_node = unsafe { tail.as_ref() };
-            if tail_node.is_root_read_() {
-                // SAFETY: 持有队列锁。
-                unsafe { tail_node.as_root_read_().state_() }.sealed_ = true;
-            }
-        }
         let node = self.alloc_node_(q, WaitNode::new_write(WaitKind::Write, Option::None));
         self.push_back_(q, node);
-        self.note_exclusive_queued_(q);
         // SAFETY: 持有队列锁。
-        unsafe { node.as_ref().as_write_() }.set_counted_(true);
+        unsafe { node.as_ref().as_write_().set_counted_(true) };
+        self.note_exclusive_queued_(q);
         PendingWait {
             node_: node,
             kind_: WaitKind::Write,
@@ -401,9 +462,9 @@ where
     fn enqueue_upgrade_front_(&self, q: &mut QueuePayload) -> PendingWait {
         let node = self.alloc_node_(q, WaitNode::new_write(WaitKind::Upgrade, Option::None));
         self.push_front_(q, node);
-        self.note_exclusive_queued_(q);
         // SAFETY: 持有队列锁。
-        unsafe { node.as_ref().as_write_() }.set_counted_(true);
+        unsafe { node.as_ref().as_write_().set_counted_(true) };
+        self.note_exclusive_queued_(q);
         PendingWait {
             node_: node,
             kind_: WaitKind::Upgrade,
@@ -415,36 +476,14 @@ where
         q: &mut QueuePayload,
         group: NonNull<WaitNode>,
     ) -> PendingWait {
-        // SAFETY: `group` 由活跃读者组指针给出，在本 guard 存活期间不会回收。
-        let state = unsafe { group.as_ref().as_root_read_().state_() };
-        if let Option::Some(existing) = state.upgrade_ {
-            // SAFETY: `existing` 是本组预留的升级节点。
-            let write = unsafe { existing.as_ref() }.as_write_();
-            let old = write.state_();
-            if matches!(
-                old,
-                SlotState::Reserved | SlotState::Waiting | SlotState::Admitted
-            ) {
-                return PendingWait {
-                    node_: existing,
-                    kind_: WaitKind::Upgrade,
-                };
-            }
-            // 已经取消/领取的旧节点：摘除并释放，重新分配。
-            state.upgrade_ = Option::None;
-            self.unlink_linked_(q, existing);
-            self.free_node_(q, existing);
-        }
-
         let node = self.alloc_node_(
             q,
             WaitNode::new_write(WaitKind::Upgrade, Option::Some(group)),
         );
         self.insert_after_(q, group, node);
-        state.upgrade_ = Option::Some(node);
-        self.note_exclusive_queued_(q);
         // SAFETY: 持有队列锁。
-        unsafe { node.as_ref().as_write_() }.set_counted_(true);
+        unsafe { node.as_ref().as_write_().set_counted_(true) };
+        self.note_exclusive_queued_(q);
         PendingWait {
             node_: node,
             kind_: WaitKind::Upgrade,
@@ -457,13 +496,9 @@ where
         let node = unsafe { pending.node_.as_ref() };
 
         if node.is_reader_() {
-            let group = node.as_reader_().root_();
+            let reader = node.as_reader_();
+            let group = reader.root_();
             if q.head_ != Option::Some(group) {
-                return false;
-            }
-            // SAFETY: 持有队列锁。
-            let state = unsafe { group.as_ref().as_root_read_().state_() };
-            if state.waking_ {
                 return false;
             }
             let snap = self.stat_.snapshot();
@@ -474,21 +509,52 @@ where
                 return false;
             }
             if self.try_claim_(pending.kind_) {
+                // SAFETY: 组仍存活；`group` 是主队列头。
+                let root = unsafe { group.as_ref() }.as_root_read_();
+                root.inc_count_();
+                if pending.kind_ == WaitKind::UpgradableRead {
+                    root.set_upgr_active_();
+                }
+                // SAFETY: 持有队列锁。
+                unsafe { reader.set_state_(SlotState::Acquired) };
                 self.set_active_group_(group);
-                let claimed = node
-                    .as_reader_()
-                    .claim_(pending.kind_ == WaitKind::UpgradableRead);
-                debug_assert!(claimed.is_some(), "直接领取时读者节点状态异常");
-                return claimed.is_some();
+                return true;
             }
             return false;
         }
 
         let write = node.as_write_();
+        let snap = self.stat_.snapshot();
+
+        // 组后继的升级写节点：组已只剩可升级读持锁时可直接领取。
+        if write.kind_() == WaitKind::Upgrade
+            && let Option::Some(group) = write.root_()
+        {
+            if q.head_ != Option::Some(group) {
+                return false;
+            }
+            // SAFETY: `group` 是主队列中仍然存活的节点。
+            let root = unsafe { group.as_ref() }.as_root_read_();
+            if root.count_() != 1 || !root.upgr_active_() {
+                return false;
+            }
+            if snap.reader_count == D::ONE
+                && snap.upgrade_active
+                && !snap.writer_active
+                && self.try_claim_(WaitKind::Upgrade)
+            {
+                // SAFETY: 持有队列锁。
+                unsafe { write.set_state_(SlotState::Acquired) };
+                self.set_active_group_(group);
+                self.finish_write_node_(q, pending.node_);
+                return true;
+            }
+            return false;
+        }
+
         if q.head_ != Option::Some(pending.node_) {
             return false;
         }
-        let snap = self.stat_.snapshot();
         let admitted = match write.kind_() {
             WaitKind::Write => {
                 snap.reader_count == D::ZERO && !snap.writer_active && !snap.upgrade_active
@@ -502,46 +568,37 @@ where
             return false;
         }
         if self.try_claim_(pending.kind_) {
-            let claimed = write.claim_();
-            debug_assert!(claimed.is_some(), "直接领取时写者节点状态异常");
-            if claimed.is_some() {
-                if pending.kind_ == WaitKind::Upgrade
-                    && let Option::Some(group) = write.root_()
-                {
-                    self.set_active_group_(group);
-                }
-                self.finish_write_node_(q, pending.node_);
-                return true;
-            }
+            // SAFETY: 持有队列锁。
+            unsafe { write.set_state_(SlotState::Acquired) };
+            self.finish_write_node_(q, pending.node_);
+            return true;
         }
         false
     }
 
-    fn register_waker_(&self, q: &mut QueuePayload, pending: &PendingWait, waker: &Waker) {
-        // SAFETY: `pending.node_` 仍存活。
+    fn register_waker_(&self, pending: &PendingWait, waker: &Waker) {
+        // SAFETY: `pending.node_` 仍存活；持有队列锁。
         let node = unsafe { pending.node_.as_ref() };
         if node.is_reader_() {
-            node.as_reader_().set_waker_(waker);
-            return;
-        }
-        let write = node.as_write_();
-        let old = write.state_();
-        if old == SlotState::Reserved {
-            let was_reserved = write.adopt_(waker);
-            if was_reserved {
-                self.note_exclusive_queued_(q);
-                write.set_counted_(true);
+            // SAFETY: 持有队列锁。
+            unsafe {
+                node.as_reader_().set_state_(SlotState::Waiting);
+                node.as_reader_().set_waker_(waker);
             }
-            return;
+        } else {
+            // SAFETY: 持有队列锁。
+            unsafe {
+                node.as_write_().set_state_(SlotState::Waiting);
+                node.as_write_().set_waker_(waker);
+            }
         }
-        write.set_waker_(waker);
     }
 
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
     // 放行 / 唤醒
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    /// 剪掉队首已经没有任何待决节点的读者组/写者。
+    /// 回收队首已经没有任何持锁者/等待者的读者组。
     fn prune_front_(&self, q: &mut QueuePayload) {
         loop {
             let Option::Some(front) = q.head_ else {
@@ -552,23 +609,14 @@ where
             if node.is_root_read_() {
                 let root = node.as_root_read_();
                 // SAFETY: 持有队列锁。
-                let state = unsafe { root.state_() };
-                if root.count_() != 0
-                    || root.pending_() != 0
-                    || root.release_ops_() != 0
-                    || state.waking_
-                {
-                    return;
+                if root.count_() == 0 && !unsafe { root.has_waiting_() } {
+                    debug_assert!(!root.upgr_active_(), "空读者组仍带有可升级读持锁标记");
+                    self.free_group_(q, front);
+                    continue;
                 }
-                // SAFETY: 持有队列锁；链节点在组存活期间有效。
-                if unsafe { state.has_waiting_() } {
-                    return;
-                }
-                self.free_group_(q, front);
-                continue;
+                return;
             }
-            // 写者节点：已领取/已取消的由领取者/取消者自己收尾。这里不能
-            // 抢先释放，否则会与“状态已改、尚未取队列锁收尾”的线程重复释放。
+            // 写者节点由领取/取消方自己收尾，这里不能抢先释放。
             return;
         }
     }
@@ -600,20 +648,9 @@ where
         if node.is_root_read_() {
             let root = node.as_root_read_();
             // SAFETY: 持有队列锁。
-            let state = unsafe { root.state_() };
-            if state.waking_ {
-                q.retry_ = true;
-                return Option::None;
-            }
-            // SAFETY: 持有队列锁；链节点在组存活期间有效。
-            if unsafe { state.has_waiting_() } {
-                state.sealed_ = true;
-                state.waking_ = true;
-                self.set_active_group_(front);
+            if unsafe { root.has_waiting_() } {
                 return Option::Some(Selection::Group(front));
             }
-            // 活跃读者组没有待放行读者：只有 count==1 且组内有已领取的
-            // UpgrRead 时，才允许把后继的升级写节点作为下一个待激活写者。
             if root.count_() == 1 && root.upgr_active_() {
                 // SAFETY: 持有队列锁。
                 let next = unsafe { front.as_ref().next_() };
@@ -640,9 +677,6 @@ where
         if matches!(write.state_(), SlotState::Acquired | SlotState::Cancelled) {
             return Option::None;
         }
-        if write.state_() == SlotState::Reserved {
-            return Option::None;
-        }
         let admitted = match write.kind_() {
             WaitKind::Write => snap.reader_count == D::ZERO && !snap.upgrade_active,
             WaitKind::Upgrade => snap.reader_count == D::ONE && snap.upgrade_active,
@@ -655,74 +689,80 @@ where
         }
     }
 
-    /// 锁外唤醒一个选中目标；返回是否真的放行了槽位。
-    fn wake_selection_(&self, selected: Selection) -> bool {
-        match selected {
-            Selection::Group(group) => self.wake_group_(group),
-            Selection::Write(node) => {
-                // SAFETY: `node` 是 select_head_ 选中的存活节点。
-                let write = unsafe { node.as_ref() }.as_write_();
-                match write.admit_() {
-                    Option::Some(waker) => {
-                        waker.wake();
-                        true
-                    }
-                    Option::None => false,
-                }
-            }
-        }
-    }
-
-    fn wake_group_(&self, group: NonNull<WaitNode>) -> bool {
+    /// 在队列锁内放行一批读者；返回锁外要唤醒的 waker。
+    fn admit_group_batch_(&self, group: NonNull<WaitNode>) -> WakerBatch {
         // SAFETY: `group` 是 select_head_ 选中的存活读者组。
         let root = unsafe { group.as_ref() }.as_root_read_();
-        // SAFETY: 读者链已封口，`head_`/`next_` 只读；组由 waking_ 保持存活。
-        let mut cur = unsafe { root.head_() };
-        let mut woke = false;
+        let mut batch = WakerBatch::new();
         let snap = self.stat_.snapshot();
+        // SAFETY: 持有队列锁。
+        let mut cur = unsafe { root.head_() };
         while let Option::Some(node) = cur {
-            // SAFETY: 链节点在组存活期间一直有效。
-            let node_ref = unsafe { node.as_ref() };
-            // SAFETY: 链已封口，`next_` 稳定。
-            let next = unsafe { node_ref.next_() };
-            if node_ref.is_upgr_read_() && snap.upgrade_active {
-                cur = next;
-                continue;
+            if batch.is_full() {
+                break;
             }
-            if let Option::Some(waker) = node_ref.as_reader_().admit_() {
-                waker.wake();
-                woke = true;
+            // SAFETY: 链节点在组存活期间有效；持有队列锁。
+            let node_ref = unsafe { node.as_ref() };
+            // SAFETY: 同上。
+            let next = unsafe { node_ref.next_() };
+            if node_ref.as_reader_().state_() == SlotState::Waiting {
+                let skip = node_ref.is_upgr_read_() && snap.upgrade_active;
+                if !skip {
+                    // SAFETY: 持有队列锁。
+                    if let Option::Some(waker) = unsafe { node_ref.as_reader_().take_waker_() } {
+                        // SAFETY: 持有队列锁。
+                        unsafe { node_ref.as_reader_().set_state_(SlotState::Admitted) };
+                        root.inc_count_();
+                        batch.push(waker);
+                    }
+                }
             }
             cur = next;
         }
-
-        let mut q = self.queue_.lock();
-        // SAFETY: `group` 在唤醒期间由 waking_ 保持存活。
-        let state = unsafe { group.as_ref().as_root_read_().state_() };
-        state.waking_ = false;
-        let retry = q.retry_;
-        q.retry_ = false;
-        drop(q);
-        woke || retry
+        batch
     }
 
-    /// 推进放行流程。
+    fn wake_selection_(&self, selection: Selection) -> WakerBatch {
+        match selection {
+            Selection::Group(group) => self.admit_group_batch_(group),
+            Selection::Write(node) => {
+                let mut batch = WakerBatch::new();
+                // SAFETY: `node` 是 select_head_ 选中的存活节点。
+                let write = unsafe { node.as_ref() }.as_write_();
+                if write.state_() == SlotState::Waiting
+                    // SAFETY: 持有队列锁。
+                    && let Option::Some(waker) = unsafe { write.take_waker_() }
+                {
+                    // SAFETY: 持有队列锁。
+                    unsafe { write.set_state_(SlotState::Admitted) };
+                    batch.push(waker);
+                }
+                batch
+            }
+        }
+    }
+
+    /// 推进放行流程；锁外唤醒每一批 waker。
     fn run_pass_(&self) {
         if !self.stat_.waiters_present() {
             return;
         }
         loop {
-            let selected = {
+            let mut batch = {
                 let mut q = self.queue_.lock();
                 self.prune_front_(&mut q);
-                self.select_head_(&mut q)
+                match self.select_head_(&mut q) {
+                    Option::None => break,
+                    Option::Some(selection) => {
+                        // `wake_selection_` 只做状态迁移与取 waker，不调用 wake。
+                        self.wake_selection_(selection)
+                    }
+                }
             };
-            let Option::Some(selected) = selected else {
-                break;
-            };
-            if !self.wake_selection_(selected) {
+            if batch.is_empty() {
                 break;
             }
+            batch.wake_all();
         }
     }
 
@@ -730,71 +770,38 @@ where
     // 领取收尾 / 组回收
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    fn finish_claimed_(&self, kind: WaitKind, node: NonNull<WaitNode>) {
-        // SAFETY: `node` 是刚刚领取成功的存活节点。
-        if unsafe { node.as_ref() }.is_reader_() {
-            return;
-        }
-        // SAFETY: 同上。
-        debug_assert_eq!(kind, unsafe { node.as_ref() }.as_write_().kind_());
-        let mut q = self.queue_.lock();
-        self.finish_write_node_(&mut q, node);
-        drop(q);
-        self.run_pass_();
-    }
-
     /// 释放一个已领取/已取消的写者节点，并维护计数。
     fn finish_write_node_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
         // SAFETY: `node` 是主队列中仍然存活的写者节点。
         let write = unsafe { node.as_ref() }.as_write_();
         if write.counted_() {
-            write.set_counted_(false);
+            // SAFETY: 持有队列锁。
+            unsafe { write.set_counted_(false) };
             debug_assert!(q.writer_waiters_ > 0, "writer_waiters_ underflow");
             q.writer_waiters_ = q.writer_waiters_.saturating_sub(1);
             if q.writer_waiters_ == 0 {
                 self.stat_.clear_writer_queued();
             }
         }
-        if let Option::Some(group) = write.root_() {
-            // SAFETY: `group` 由该升级节点的 `root_` 保持存活。
-            let state = unsafe { group.as_ref().as_root_read_().state_() };
-            if state.upgrade_ == Option::Some(node) {
-                state.upgrade_ = Option::None;
-            }
-        }
-        self.unlink_linked_(q, node);
+        self.unlink_(q, node);
         self.free_node_(q, node);
     }
 
-    /// 批量回收整个读者组：读者链节点、升级预留节点与根节点。
+    /// 批量回收整个空读者组：读者链节点与根节点。
     fn free_group_(&self, q: &mut QueuePayload, group: NonNull<WaitNode>) {
         // SAFETY: `group` 是主队列中仍然存活的读者组。
         let root = unsafe { group.as_ref() }.as_root_read_();
+        debug_assert_eq!(root.count_(), 0, "回收仍有持锁者的读者组");
 
-        // SAFETY: `group` 是主队列中仍然存活的读者组。
-        let root_active = unsafe { group.as_ref() }.as_root_read_();
-        debug_assert!(
-            !root_active.upgr_active_(),
-            "读者组回收时仍有可升级读持锁者"
-        );
-        debug_assert_eq!(root.release_ops_(), 0, "读者组回收时仍有释放收尾在进行");
+        self.unlink_(q, group);
+
         // SAFETY: 持有队列锁。
-        let upgrade = unsafe { root.state_() }.upgrade_.take();
-        if let Option::Some(upgrade) = upgrade {
-            // 复用统一收尾：如果它已被升级请求接管并计入写者等待，会在这里
-            // 归还 `writer_waiters_`；休眠占位则直接回收。
-            // 注意：这里必须先结束对 `state_` 的借用，再调用可能重新取得
-            // `&mut RootState` 的收尾函数，避免同一 `UnsafeCell` 上出现别名。
-            self.finish_write_node_(q, upgrade);
+        let mut cur = unsafe { root.head_() };
+        // SAFETY: 持有队列锁。
+        unsafe {
+            root.set_head_(Option::None);
+            root.set_tail_(Option::None);
         }
-
-        let mut cur = {
-            // SAFETY: 持有队列锁。
-            let state = unsafe { root.state_() };
-            let head = state.head_.take();
-            state.tail_ = Option::None;
-            head
-        };
         while let Option::Some(node) = cur {
             // SAFETY: 链节点在组存活期间一直有效。
             let next = unsafe { node.as_ref().next_() };
@@ -802,7 +809,6 @@ where
             cur = next;
         }
 
-        self.unlink_linked_(q, group);
         self.clear_active_group_(group);
         self.free_node_(q, group);
 
@@ -829,7 +835,6 @@ where
             None => q.head_ = Option::Some(node),
         }
         q.tail_ = Option::Some(node);
-        self.mark_linked_(node, true);
     }
 
     fn push_front_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
@@ -845,7 +850,6 @@ where
             None => q.tail_ = Option::Some(node),
         }
         q.head_ = Option::Some(node);
-        self.mark_linked_(node, true);
     }
 
     fn insert_after_(&self, q: &mut QueuePayload, at: NonNull<WaitNode>, node: NonNull<WaitNode>) {
@@ -861,13 +865,10 @@ where
             Some(next) => unsafe { next.as_ref().set_prev_(Option::Some(node)) },
             None => q.tail_ = Option::Some(node),
         }
-        self.mark_linked_(node, true);
     }
 
-    fn unlink_linked_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
-        if !self.is_linked_(node) {
-            return;
-        }
+    /// 从主队列摘除一个确定仍然在链上的节点。
+    fn unlink_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
         // SAFETY: `node` 是主队列中仍然存活的节点；持有队列锁。
         let prev = unsafe { node.as_ref().prev_() };
         let next = unsafe { node.as_ref().next_() };
@@ -885,31 +886,6 @@ where
         unsafe {
             node.as_ref().set_prev_(Option::None);
             node.as_ref().set_next_(Option::None);
-        }
-        self.mark_linked_(node, false);
-    }
-
-    fn mark_linked_(&self, node: NonNull<WaitNode>, linked: bool) {
-        // SAFETY: `node` 仍然存活；持有队列锁。
-        let node_ref = unsafe { node.as_ref() };
-        if node_ref.is_root_read_() {
-            // SAFETY: 持有队列锁。
-            unsafe { node_ref.as_root_read_().state_() }.linked_ = linked;
-        } else if node_ref.is_write_() {
-            node_ref.as_write_().set_linked_(linked);
-        }
-    }
-
-    fn is_linked_(&self, node: NonNull<WaitNode>) -> bool {
-        // SAFETY: `node` 仍然存活；持有队列锁。
-        let node_ref = unsafe { node.as_ref() };
-        if node_ref.is_root_read_() {
-            // SAFETY: 持有队列锁。
-            unsafe { node_ref.as_root_read_().state_() }.linked_
-        } else if node_ref.is_write_() {
-            node_ref.as_write_().linked_()
-        } else {
-            false
         }
     }
 
@@ -967,20 +943,11 @@ where
         }
     }
 
-    fn slot_state_(&self, node: &WaitNode) -> SlotState {
+    fn node_state_(&self, node: &WaitNode) -> SlotState {
         if node.is_reader_() {
             node.as_reader_().state_()
         } else {
             node.as_write_().state_()
-        }
-    }
-
-    fn claim_node_(&self, node: &WaitNode, kind: WaitKind) -> Option<SlotState> {
-        if node.is_reader_() {
-            node.as_reader_().claim_(kind == WaitKind::UpgradableRead)
-        } else {
-            debug_assert_eq!(kind, node.as_write_().kind_());
-            node.as_write_().claim_()
         }
     }
 
@@ -1020,49 +987,16 @@ where
         };
         // SAFETY: 活跃组在 count_ > 0 期间不会回收；本 guard 占着一个计数。
         let root = unsafe { group.as_ref() }.as_root_read_();
-        // 先登记“释放收尾进行中”，保证 2→1 的线程在访问组做升级预留时，
-        // 1→0 的线程不会提前把组回收掉。
-        root.begin_release_();
+        if is_upgradable {
+            root.clear_upgr_active_();
+        }
         let old = root.dec_count_();
         debug_assert!(old >= 1, "读者组 count_ 下溢");
-        if is_upgradable {
-            root.set_upgr_active_(false);
+        if old == 1 {
+            // 最后一个计数归零：触发一次 pass，由队首 prune 回收空组。
+            // 这里不再使用 `group` 指针，避免与并发 prune 竞争。
+            self.run_pass_();
         }
-        match old {
-            1 => {
-                // 减到 0：交给队首 prune 批量回收；如果还有别的释放收尾在
-                // 进行，prune 会等它们结束。
-                root.end_release_();
-                self.run_pass_();
-            }
-            2 => {
-                // 减到 1：若剩余的是已领取的 UpgrRead，预分配升级写节点。
-                let mut q = self.queue_.lock();
-                self.ensure_upgrade_placeholder_(&mut q, group);
-                drop(q);
-                root.end_release_();
-                self.run_pass_();
-            }
-            _ => {
-                root.end_release_();
-            }
-        }
-    }
-
-    /// 在组后继预分配一个休眠升级写节点（若尚无）。
-    fn ensure_upgrade_placeholder_(&self, q: &mut QueuePayload, group: NonNull<WaitNode>) {
-        // SAFETY: `group` 由活跃组指针保持存活；持有队列锁。
-        let state = unsafe { group.as_ref().as_root_read_().state_() };
-        if state.upgrade_.is_some() {
-            return;
-        }
-        // SAFETY: `group` 由活跃组指针保持存活。
-        if !unsafe { group.as_ref() }.as_root_read_().upgr_active_() {
-            return;
-        }
-        let node = self.alloc_node_(q, WaitNode::new_reserved_upgrade(group));
-        self.insert_after_(q, group, node);
-        state.upgrade_ = Option::Some(node);
     }
 
     pub(super) fn release_writer(&self) {
@@ -1096,7 +1030,7 @@ where
             // SAFETY: 活跃组在 guard 持有期间不会回收。
             unsafe { group.as_ref() }
                 .as_root_read_()
-                .set_upgr_active_(false);
+                .clear_upgr_active_();
         }
         self.run_pass_();
     }
@@ -1113,7 +1047,7 @@ mod tests_ {
     /// Verifies a queued reader can be admitted and claimed while the writer holds.
     ///
     /// - 手段：先取写者，再以 Read 身份排队；释放写者后 poll 领取。
-    /// - 判断：释放前返回 Waiting；释放后能领取，队列最终清空。
+    /// - 判断：释放前返回 Waiting；释放后能领取，队列与 Arena 最终清空。
     #[test]
     fn queued_reader_can_be_admitted_and_claimed() {
         let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
@@ -1159,14 +1093,44 @@ mod tests_ {
         core.release_reader(false);
     }
 
-    /// 验证跨 chunk 的大读者链在最后一个读者释放时被整链批量回收。
+    /// 验证已放行但尚未领取的读者取消时直接递减持锁计数。
     ///
-    /// Verifies a large reader chain spanning Arena chunks is reclaimed in bulk
-    /// when the last reader releases.
+    /// Verifies cancelling an admitted-but-unclaimed reader decrements the hold
+    /// count directly and marks the node cancelled.
+    ///
+    /// - 手段：写者持有期间排队两个读者；释放写者使两者都变成 `Admitted`
+    ///   （组计数为 2），取消其中一个，再领取并释放另一个。
+    /// - 判断：取消后组计数降到 1；另一个读者领取、释放后计数归零，
+    ///   整组被批量回收，Arena 为空。
+    #[test]
+    fn admitted_reader_cancel_decrements_count() {
+        let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
+        assert!(core.try_write_fast(), "写者快速路径应成功");
+
+        let waker = Waker::noop();
+        let AcqProgress::Waiting(first) = core.acquire(WaitKind::Read, waker) else {
+            panic!("第一个读者应排队");
+        };
+        let AcqProgress::Waiting(second) = core.acquire(WaitKind::Read, waker) else {
+            panic!("第二个读者应排队");
+        };
+
+        core.release_writer();
+        // 两者都已被放行；取消第二个前，组计数应为 2。
+        core.cancel_wait(&second);
+        assert!(core.poll_acquire(&first, waker), "第一个读者应能领取");
+        core.release_reader(true);
+        assert!(!core.waiters_present(), "全部结束后队列应为空");
+        assert!(core.pool_is_empty(), "整组应被批量归还 Arena");
+    }
+
+    /// 验证 1100 个读者跨 Arena chunk 时仍能整链批量回收。
+    ///
+    /// Verifies a 1100-reader chain spanning Arena chunks is reclaimed in bulk.
     ///
     /// - 手段：写者持有期间排队 1100 个普通读（超过一个 chunk 的 1024 槽），
     ///   释放写者后逐个领取并释放。
-    /// - 判断：全部释放后队列与 Arena 都为空，说明没有逐节点残留。
+    /// - 判断：全部释放后队列与 Arena 都为空。
     #[test]
     fn large_reader_chain_is_batch_reclaimed() {
         let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
@@ -1193,14 +1157,13 @@ mod tests_ {
         assert!(core.pool_is_empty(), "整条大读者链应被批量归还 Arena");
     }
 
-    /// 验证读者链中间节点取消后，整链仍能在最后一个读者释放时回收。
+    /// 验证读者链中间节点取消后，整链仍能回收。
     ///
-    /// Verifies a cancelled middle reader node is reclaimed with the rest of the
-    /// chain when the last reader releases.
+    /// Verifies a cancelled middle reader node is reclaimed with the chain.
     ///
     /// - 手段：写者持有期间排队 3 个读者，取消中间一个；释放写者后领取并
     ///   释放其余两个。
-    /// - 判断：取消的节点不阻塞放行，最终队列与 Arena 都为空。
+    /// - 判断：取消节点不阻塞放行，最终队列与 Arena 都为空。
     #[test]
     fn cancelled_middle_reader_is_reclaimed_with_group() {
         let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
@@ -1227,6 +1190,86 @@ mod tests_ {
         assert!(core.pool_is_empty(), "取消节点应随整组批量回收");
     }
 
+    /// 验证可升级读先于普通读释放时不会误留升级写节点。
+    ///
+    /// Verifies releasing the upgradable reader before a plain reader does not
+    /// leave a spurious upgrade write node.
+    ///
+    /// - 手段：写者持有期间排队普通读 + 可升级读；释放写者并领取两者，
+    ///   先释放可升级读，再释放普通读。
+    /// - 判断：可升级读释放后写者仍不能进入（普通读还持有），但
+    ///   `writer_queued` 为假；普通读释放后队列为空、Arena 为空。
+    #[test]
+    fn upgradable_released_first_does_not_insert_writer() {
+        let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
+        assert!(core.try_write_fast(), "写者快速路径应成功");
+
+        let waker = Waker::noop();
+        let AcqProgress::Waiting(reader) = core.acquire(WaitKind::Read, waker) else {
+            panic!("普通读应进入队列");
+        };
+        let AcqProgress::Waiting(upgr) = core.acquire(WaitKind::UpgradableRead, waker) else {
+            panic!("可升级读应进入队列");
+        };
+        core.release_writer();
+        assert!(core.poll_acquire(&reader, waker), "普通读应能领取");
+        assert!(core.poll_acquire(&upgr, waker), "可升级读应能领取");
+
+        core.release_upgradable_read(true);
+        assert!(!core.writer_queued(), "不应为已释放的可升级读插入写者");
+        assert!(!core.try_write_fast(), "普通读仍持有写者不应进入");
+
+        core.release_reader(true);
+        assert!(!core.waiters_present(), "全部释放后队列应为空");
+        assert!(core.pool_is_empty(), "整条读者链应被批量归还 Arena");
+        assert!(core.try_write_fast(), "读者组结束后写者应能快速进入");
+        core.release_writer();
+    }
+
+    /// 验证升级请求只在真正发起时插入写节点，并在组计数为 1 时被放行。
+    ///
+    /// Verifies the upgrade write node is inserted only when the upgrade is
+    /// actually requested, and is admitted when the group count is one.
+    ///
+    /// - 手段：写者持有期间排队普通读 + 可升级读；释放写者并领取两者，
+    ///   释放普通读使组计数变成 1；确认此时没有写者等待，再发起升级。
+    /// - 判断：升级请求入队后 `writer_queued` 为真，能领取写许可；
+    ///   写者释放、可升级读释放后队列与 Arena 清空。
+    #[test]
+    fn upgrade_request_is_inserted_and_admitted() {
+        let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
+        assert!(core.try_write_fast(), "写者快速路径应成功");
+
+        let waker = Waker::noop();
+        let AcqProgress::Waiting(reader) = core.acquire(WaitKind::Read, waker) else {
+            panic!("普通读应进入队列");
+        };
+        let AcqProgress::Waiting(upgr) = core.acquire(WaitKind::UpgradableRead, waker) else {
+            panic!("可升级读应进入队列");
+        };
+        core.release_writer();
+        assert!(core.poll_acquire(&reader, waker), "普通读应能领取");
+        assert!(core.poll_acquire(&upgr, waker), "可升级读应能领取");
+
+        core.release_reader(true);
+        assert!(!core.writer_queued(), "尚未发起升级时不应有写者等待");
+
+        let upgrade = match core.acquire_upgrade(waker, true) {
+            AcqProgress::Acquired => Option::None,
+            AcqProgress::Waiting(pending) => Option::Some(pending),
+        };
+        if let Option::Some(upgrade) = &upgrade {
+            assert!(core.writer_queued(), "升级请求入队后应置位 WRITER_QUEUED");
+            assert!(core.poll_acquire(upgrade, waker), "升级请求应能领取写许可");
+        }
+        assert!(!core.try_write_fast(), "升级成功后写者应处于独占状态");
+
+        core.release_writer();
+        core.release_upgradable_read(true);
+        assert!(!core.waiters_present(), "全部释放后队列应为空");
+        assert!(core.pool_is_empty(), "整条读者链应被批量归还 Arena");
+    }
+
     /// 验证可升级读释放失败时能回退为普通读，不泄漏读者计数。
     ///
     /// Verifies releasing an upgradable read falls back to a plain reader when
@@ -1251,85 +1294,5 @@ mod tests_ {
         core.release_upgradable_read(false);
         assert_eq!(core.reader_count(), 0, "可升级读释放不应泄漏计数");
         assert!(!core.waiters_present());
-    }
-
-    /// 验证可升级读先于普通读释放时不会误留升级占位。
-    ///
-    /// Verifies releasing the upgradable reader before a plain reader does not
-    /// leave a spurious upgrade reservation.
-    ///
-    /// - 手段：写者持有期间排队普通读 + 可升级读；释放写者并领取两者，
-    ///   先释放可升级读，再释放普通读。
-    /// - 判断：可升级读释放后写者仍不能进入（普通读还持有），但
-    ///   `writer_queued` 为假；普通读释放后队列清空、Arena 清空，写者可快速进入。
-    #[test]
-    fn upgradable_released_first_does_not_reserve_writer() {
-        let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
-        assert!(core.try_write_fast(), "写者快速路径应成功");
-
-        let waker = Waker::noop();
-        let AcqProgress::Waiting(reader) = core.acquire(WaitKind::Read, waker) else {
-            panic!("普通读应进入队列");
-        };
-        let AcqProgress::Waiting(upgr) = core.acquire(WaitKind::UpgradableRead, waker) else {
-            panic!("可升级读应进入队列");
-        };
-        core.release_writer();
-        assert!(core.poll_acquire(&reader, waker), "普通读应能领取");
-        assert!(core.poll_acquire(&upgr, waker), "可升级读应能领取");
-
-        core.release_upgradable_read(true);
-        assert!(!core.writer_queued(), "不应为已释放的可升级读预留写者");
-        assert!(!core.try_write_fast(), "普通读仍持有写者不应进入");
-
-        core.release_reader(true);
-        assert!(!core.waiters_present(), "全部释放后队列应为空");
-        assert!(core.pool_is_empty(), "整条读者链应被批量归还 Arena");
-        assert!(core.try_write_fast(), "读者组结束后写者应能快速进入");
-        core.release_writer();
-    }
-
-    /// 验证读者组在首个读者释放后预分配升级占位，并能被升级请求接管。
-    ///
-    /// Verifies the reader group pre-allocates an upgrade placeholder when the
-    /// count drops to one, and that an upgrade request adopts it.
-    ///
-    /// - 手段：写者持有期间排队一个普通读与一个可升级读；释放写者后两个读者
-    ///   领取，再释放普通读（组 count 2→1）。
-    /// - 判断：可升级读随后发起的升级能领取写许可；写者释放、可升级读释放后
-    ///   队列清空且 Arena 中不再有存活节点（整组批量回收）。
-    #[test]
-    fn upgrade_placeholder_is_created_and_adopted() {
-        let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
-        assert!(core.try_write_fast(), "写者快速路径应成功");
-
-        let waker = Waker::noop();
-        let AcqProgress::Waiting(reader) = core.acquire(WaitKind::Read, waker) else {
-            panic!("普通读应进入队列");
-        };
-        let AcqProgress::Waiting(upgr) = core.acquire(WaitKind::UpgradableRead, waker) else {
-            panic!("可升级读应进入队列");
-        };
-
-        core.release_writer();
-        assert!(core.poll_acquire(&reader, waker), "普通读应能领取");
-        assert!(core.poll_acquire(&upgr, waker), "可升级读应能领取");
-
-        // 普通读释放后组 count 从 2 减到 1，应生成休眠升级占位。
-        core.release_reader(true);
-        assert!(
-            core.has_reserved_upgrade(),
-            "应为剩余的可升级读预分配写节点"
-        );
-
-        let AcqProgress::Waiting(upgrade) = core.acquire_upgrade(waker, true) else {
-            panic!("升级请求应排队");
-        };
-        assert!(core.poll_acquire(&upgrade, waker), "升级请求应能领取写许可");
-
-        core.release_writer();
-        core.release_upgradable_read(true);
-        assert!(!core.waiters_present(), "全部释放后队列应为空");
-        assert!(core.pool_is_empty(), "整条读者链应被批量归还 Arena");
     }
 }

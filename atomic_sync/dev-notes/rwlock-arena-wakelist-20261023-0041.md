@@ -1,3 +1,5 @@
+> 注：`feat/simp-read` 分支对 RootRead 做了进一步简化（单一计数原子、无 pending/release_ops/升级预留/节点锁）。本文中这些实现细节已被 [rwlock-arena-simplified-20261023-0204.md](rwlock-arena-simplified-20261023-0204.md) 取代；本文保留作为 WaitNode/WakeNode 结构与旧实现的记录。
+
 # Arena 版协作式读写锁：WaitNode / WakeNode 唤醒链重构设计
 
 ## 1. 目标与已确认决策
