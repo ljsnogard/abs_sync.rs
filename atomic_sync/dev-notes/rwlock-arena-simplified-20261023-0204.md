@@ -50,14 +50,14 @@ WakeNode::PureWrite(WriteNode)
 
 RootRead {
     state_: AtomicUsize,              // count（低位） + UPGR（最高位）
-    head_:  Cell<Option<NonNull<WaitNode>>>,  // 队列锁
-    tail_:  Cell<Option<NonNull<WaitNode>>>,  // 队列锁
+    tail_:  AtomicPtr<WaitNode>,      // 最后加入的读者；CAS 压栈
 }
 
 ReaderNode {
     root_:  NonNull<WaitNode>,
-    state_: Cell<SlotState>,                  // 队列锁
-    waker_: UnsafeCell<Option<Waker>>,        // 队列锁
+    prev_:  *mut WaitNode,                    // 读者链 LIFO 前驱（随节点一起发布）
+    state_: AtomicU8,                         // Registering/Waiting/Taking/...
+    waker_: UnsafeCell<Option<Waker>>,        // 只在 Registering/Taking 独占访问
 }
 
 WriteNode {
@@ -90,9 +90,11 @@ bit [0, N-2]   COUNT    已放行且尚未释放的读者数（含未领取）
 ### 3.1 入队
 
 - `Read` / `UpgradableRead`：
-  - 若主队列尾是 `RootRead`，且（`Read` 或链中还没有 `UpgrRead`）则追加到
-    读者链尾；
-  - 否则新建 `RootRead` 并追加到主队列尾。
+  - 若主队列尾是 `RootRead`，且（`Read` 或链中还没有 `UpgrRead`）则把新
+    节点原子地压入该组的读者链（`RootRead.tail_` CAS，`prev_` 指向旧尾）；
+  - 否则新建 `RootRead` 并追加到主队列尾；
+  - 节点分配仍在队列锁内（Arena 由队列锁保护），但链入本身是 CAS，
+    注册/领取/取消完全在锁外。
 - `Write`：新建 `PureWrite(Write)` 追加到主队列尾。
 - `Upgrade`：
   - 有活跃读者组（`tracked`）时，新建 `PureWrite(Upgrade)` 插到该组后继；
@@ -109,8 +111,9 @@ bit [0, N-2]   COUNT    已放行且尚未释放的读者数（含未领取）
    - 有等待读者的 `RootRead`；
    - 或可放行的 `PureWrite`（普通写者 / 升级写者）；
 3. 在锁内：
-   - 对 `RootRead` 的读者链最多取 `WAKE_BATCH = 32` 个 `Waiting` 读者，
-     把 waker 取进栈上 `WakerBatch`，标 `Admitted`，`count += 1`；
+   - 沿 `RootRead.tail_` 的 `prev_` 链最多处理 `WAKE_BATCH = 32` 个读者；
+     对 `Waiting` 节点用 CAS `Waiting -> Taking` 取走 waker，再标 `Admitted`，
+     `count += 1`；`Registering` / `Taking` 节点由各自的所有者推进，遍历跳过；
    - 对写者：取 waker、标 `Admitted`；
 4. 释放锁，`WakerBatch::wake_all()`；
 5. 回到 1，重新从队首选择，继续下一批。
@@ -168,8 +171,10 @@ release_group_reader_(is_upgradable):
 | 读者链封口 | `sealed_` | 主队列尾 + `has_upgr_read_` |
 | 唤醒互斥 | `waking_` + `retry_` | 队列锁 + 每轮重新选队首 |
 | 节点链接标记 | `linked_` | 领取/取消方唯一摘链，无需标记 |
-| 节点状态/waker | 每节点一把 `SpinLock` | 队列锁统一保护 |
-| 读者领取 | 无锁 CAS | 队列锁内 CAS + 状态迁移 |
+| 节点状态/waker | 每节点一把 `SpinLock` | 读者：AtomicU8 状态机；写者：队列锁 |
+| 读者链 | 头/尾 `Cell`，插入序 | 原子尾指针 + `prev_` 的 LIFO 链 |
+| 读者领取 | 无锁 CAS | 无锁 CAS + 原子状态迁移 |
+| 读者取消/注册 | 队列锁 | 无锁原子状态机 |
 
 ## 6. 验证
 
@@ -193,3 +198,58 @@ release_group_reader_(is_upgradable):
 - `Waker::clone` 与 waker drop 现在发生在队列锁内；`Waker::wake` 仍在锁外。
 - 唤醒批次上限为 32；大读者链会分多轮取锁，但每轮不分配堆内存。
 - 后续可补一个 Arena 版专用基准，对比简化前后的读者热路径与升级路径开销。
+
+
+## 8. 读者原子路径（2026-10-23 02:25 追加）
+
+上一版把读者状态与 waker 放在队列锁下，导致 `poll` 领取、取消、waker 注册
+都要取队列锁。这一版把它们移出：
+
+### 8.1 读者状态机
+
+```text
+Registering --(注册完成)--> Waiting --(唤醒者 CAS)--> Taking --(取走 waker)--> Admitted
+     ^                          |                                                |
+     |                          +------------------(取消)--> Cancelled           |
+     |                                                                           |
+     +----------------------------(领取失败/重新挂起)-----------------------------+
+```
+
+- `register_waker_`：只从 `Registering` / `Waiting` 进入；写 waker 后 CAS 到
+  `Waiting`。如果期间节点已被放行成 `Admitted`，返回 `false`，调用方转入
+  领取而不是把它降回 `Waiting`（避免丢失已累加的计数）。
+- `rewait_`：领取失败时先把放行计数减一，再从 `Admitted` 重新挂起。
+- `try_admit_`：唤醒者 CAS `Waiting -> Taking`，取 waker，存 `Admitted`；
+  若 waker 缺失则回退 `Waiting`（不应发生，带 `debug_assert`）。
+- `cancel_`：CAS 到 `Cancelled`；`Waiting` 时清 waker，`Taking` 时自旋等
+  唤醒者完成。取消是持有者自己的 future Drop，不需要队列锁。
+- `mark_acquired_`：领取成功后存 `Acquired`。
+
+### 8.2 读者链 LIFO
+
+`RootRead` 只保存 `tail_: AtomicPtr<WaitNode>`；新读者：
+
+```text
+new.prev = tail.load()
+CAS(tail, old, new)
+```
+
+读者链从 `tail` 沿 `prev` 反向遍历。发布在队列锁内完成（与唤醒遍历互斥），
+所以遍历期间链稳定；但“压栈”本身是一次 CAS。
+
+### 8.3 队列锁还剩什么
+
+- Arena 节点分配（Arena 本身由队列锁保护）；
+- 主队列的入队/摘链、写者节点状态与 waker；
+- 唤醒遍历（选队首、批量 `try_admit_`、取 waker）与空组回收。
+
+读者领取、取消、重新注册不再取队列锁；只有 `Registering`/`Taking` 的极短
+重叠会让某一方做一次 `spin_loop`，这不是队列锁，也不覆盖主队列。
+
+### 8.4 验证
+
+- `cargo test -p atomic_sync`：87 个单测 + 2 个 Arena 集成 + 7 个 cooperative
+  集成 + 8 个 preemptive + 4 个文档测试全部通过；
+- `cargo clippy -p atomic_sync --all-targets` 无告警；
+- `cooperative_arena` 库测试连续 20 轮压力通过；
+- Miri（`-Zmiri-strict-provenance`）：8 个 core 单测通过。
