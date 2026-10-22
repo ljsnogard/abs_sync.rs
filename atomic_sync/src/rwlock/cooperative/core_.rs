@@ -421,8 +421,12 @@ where
     pub(super) fn release_upgradable_read(&self) {
         // 注意：状态迁移**必须**无条件执行；把它写进 `debug_assert!` 里
         // 会让 release 构建直接跳过迁移（这里曾经真的踩过这个坑）。
-        let _ok = self.stat_.release_upgradable_read();
-        debug_assert!(_ok, "state transition `release_upgradable_read` failed");
+        if !self.stat_.release_upgradable_read() {
+            // 该守卫可能已经被并行的“写者降级为可升级读”转换成了普通读
+            // （`UPGRADE_ACTIVE` 已清除）。此时按普通读归还，避免读者计数泄漏。
+            let fallback = self.stat_.release_reader();
+            debug_assert!(fallback, "可升级读释放失败且无法回退为普通读");
+        }
         self.run_pass_();
     }
 

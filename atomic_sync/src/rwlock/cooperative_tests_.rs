@@ -7,6 +7,8 @@
 //! - `#[tokio::test(flavor = "multi_thread")]` 是多线程执行器：等待者与
 //!   释放者会真的并行，用来压跨线程唤醒与内部自旋锁。
 
+#![allow(clippy::duplicate_mod)]
+
 use core::future::{Future, IntoFuture};
 use std::{
     boxed::Box,
@@ -586,4 +588,132 @@ async fn upgradable_reader_should_promote_under_contention() {
 
     let mut s = lock.acquire_session();
     assert_eq!(*s.read_async().await.unwrap(), ITERS);
+}
+
+/// 测试队列放行的可升级读在“升级为写 → 回退为可升级读 → 降级为普通读”期间，
+/// 读者组必须一直保留到最后一个持锁者释放。
+///
+/// Tests that a queued reader group stays alive across upgrade → fallback →
+/// downgrade until the last holder releases.
+///
+/// - 手段：主任务持有写锁，spawn 一个任务排队获取可升级读；释放写锁后，
+///   该任务升级为写者、释放写者回退为可升级读，再降级为普通读并等待；
+///   主任务在它降级后尝试写（应失败）和读（应成功），最后放行该任务。
+/// - 判断：降级后的读仍占着读者组，写者必须拿不到；普通读可以共享；
+///   该读者释放后写者立刻可得，且 `reader_count` 归零。
+#[compio::test]
+async fn queued_upgradable_group_survives_upgrade_and_downgrade() {
+    let lock = Arc::new(TestLock::new_owned(0));
+    let mut sess_hold = lock.acquire_session();
+    let hold = sess_hold.try_write().unwrap();
+
+    let downgraded = Arc::new(AtomicBool::new(false));
+    let allow_release = Arc::new(AtomicBool::new(false));
+    let released = Arc::new(AtomicBool::new(false));
+
+    let l = Arc::clone(&lock);
+    let d = Arc::clone(&downgraded);
+    let a = Arc::clone(&allow_release);
+    let r = Arc::clone(&released);
+    let task = compio::runtime::spawn(async move {
+        let mut sess = l.acquire_session();
+        let upg = sess.upgradable_read_async().await.unwrap();
+        let mut upg_sess = upg.upgrade_session();
+        {
+            let mut w = upg_sess.upgrade_async().await.unwrap();
+            *w += 1;
+        }
+        // 写者释放后回退为可升级读，再降级为普通读。
+        let guard = upg_sess.into_guard();
+        let reader = guard.downgrade();
+        d.store(true, Ordering::Release);
+        while !a.load(Ordering::Acquire) {
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(reader);
+        r.store(true, Ordering::Release);
+    });
+
+    // 确认排队任务尚未拿到可升级读（主任务仍持有写锁）。
+    let_tasks_settle().await;
+    assert!(
+        !downgraded.load(Ordering::Acquire),
+        "写者持有时不应完成降级"
+    );
+
+    drop(hold);
+    let ok = with_timeout(
+        async {
+            while !downgraded.load(Ordering::Acquire) {
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+            true
+        },
+        compio::time::sleep(Duration::from_millis(500)),
+    )
+    .await;
+    assert_eq!(ok, Some(true), "可升级读应完成升级、回退与降级");
+
+    // 降级后的普通读仍属于原读者组，写者拿不到；普通读可以共享。
+    assert!(
+        matches!(sess_hold.try_write(), Err(CoopRwLockError::WouldBlock)),
+        "降级读未释放前写者不应成功"
+    );
+    {
+        let r = sess_hold.try_read().expect("普通读应能共享");
+        assert_eq!(*r, 1);
+    }
+
+    allow_release.store(true, Ordering::Release);
+    let ok = with_timeout(
+        async {
+            while !released.load(Ordering::Acquire) {
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+            true
+        },
+        compio::time::sleep(Duration::from_millis(500)),
+    )
+    .await;
+    assert_eq!(ok, Some(true), "降级读应能释放");
+    task.await.unwrap();
+    assert_eq!(lock.reader_count(), 0);
+    let w = sess_hold.try_write().expect("最后一个读者释放后写者应成功");
+    assert_eq!(*w, 1);
+}
+
+/// 测试升级写者降级为可升级读、再降级为普通读后，原可升级读守卫释放时
+/// 能按普通读回退，不泄漏读者计数。
+///
+/// Tests that after an upgraded writer is downgraded to upgradable read and
+/// then to plain read, releasing the original upgradable guard falls back to a
+/// plain reader and does not leak the reader count.
+///
+/// - 手段：先取可升级读并升级为写者；把写者降级为可升级读、再降级为普通读
+///   并释放；最后释放 `Upgrade` 会话中的原可升级读守卫。
+/// - 判断：所有守卫释放后 `reader_count` 归零，锁仍可再次取写；
+///   若释放路径不做普通读回退，`UPGRADE_ACTIVE` 已被降级清除，计数会泄漏。
+#[compio::test]
+async fn upgraded_writer_downgrade_back_to_reader_releases_counts() {
+    let lock = TestLock::new_owned(0);
+    let mut sess = lock.acquire_session();
+    let upg = sess.upgradable_read_async().await.unwrap();
+    let mut upg_sess = upg.upgrade_session();
+
+    {
+        let w = upg_sess.upgrade_async().await.unwrap();
+        // 升级写者降级为可升级读，再降级为普通读。
+        let extra_upg = w.downgrade_to_upgradable();
+        let extra_reader = extra_upg.downgrade();
+        drop(extra_reader);
+    }
+
+    // `upg_sess` 仍持有最初的可升级读守卫；此时 `UPGRADE_ACTIVE` 已被
+    // 额外降级路径清除，释放必须回退成普通读。
+    let original = upg_sess.into_guard();
+    drop(original);
+    assert_eq!(lock.reader_count(), 0, "不应泄漏读者计数");
+
+    let w = sess.try_write().expect("计数归零后写者应能进入");
+    drop(w);
 }

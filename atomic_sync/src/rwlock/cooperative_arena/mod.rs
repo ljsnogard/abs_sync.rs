@@ -1,8 +1,8 @@
 //! 协作式（cooperative）读写锁——Arena 等待队列实现。
 //!
-//! 本模块与堆分配版 **对外 API 完全一致**，仅等待队列的承载方式不同：节点由
-//! 内部 Arena 分配，队列是侵入式双向链表。选择哪一版由 `rwlock` 顶层的
-//! `cooperative-arena` feature 决定，本文件内部不再出现 feature 分支。
+//! 本模块与堆分配版 **对外 API 完全一致**，仅等待队列的承载方式不同：所有
+//! 等待节点都是同一个 [`WaitNode`](wait_node_::WaitNode)，由内部 Arena 分配；
+//! 节点内容用 `WakeNode` 区分读者组根、读者与写者。
 //!
 //! # 结构总览
 //!
@@ -14,37 +14,39 @@
 //!
 //! RwCoreArena<D, B, O>
 //! ├── stat_  : CoopRwState<D, B, O>          // 状态字
+//! ├── active_read_group_                    // 当前活跃读者组（快速路径不参与）
 //! └── queue_ : SpinLock<QueuePayload>
-//!     ├── head_ / tail_ : NonNull<ArenaItem>
+//!     ├── head_ / tail_ : NonNull<WaitNode> // 主队列：RootRead / PureWrite
 //!     ├── writer_waiters_
-//!     └── arena_ : Arena<ArenaItem>          // 节点 + 槽位共用池
+//!     └── arena_ : Arena<WaitNode>          // 统一等待节点池
 //! ```
 //!
-//! # 并发模型
+//! # 主队列与读者链
 //!
-//! 快速路径、放行语义、取消回收与升级插队规则与堆分配版逐条一致；区别只在
-//! 等待节点/槽位的生命周期：
+//! ```text
+//! 主队列（prev_/next_）: RootRead ──> PureWrite ──> RootRead ──> ...
+//!                          │
+//! 读者链（next_ 单链）:     PureRead ──> PureRead ──> UpgrRead（至多一个）
+//! ```
 //!
-//! - 入队时为节点和槽位各取一个 Arena 元素，节点插入链表，槽位插入节点的
-//!   侵入式槽位链；
-//! - 节点从队首回收后，槽位与节点依次归还 Arena；非当前 chunk 清空时整块
-//!   归还分配器；
-//! - 元素地址在存活期间稳定，因此链表直接保存裸指针，不需要 `Arc`、`Vec`
-//!   或索引；
-//! - 队列锁只负责入队/摘链、队首选择与 `sealed_` / `waking_` 标记；
-//! - 被选中的节点封口后，唤醒者在锁外逐个槽位取 waker 并唤醒；
-//! - 已放行的读者直接 CAS 领取，只有最后一个 pending 槽位完成时才取一次
-//!   队列锁推进队列。
+//! - `RootRead` 保存当前持锁读者数 `count_` 与读者链头；
+//! - 一条读者链可混合普通读与可升级读，但至多一个可升级读；
+//! - 读者组只要 `count_ > 0` 就留在主队列；可升级读在“升级为写者 → 回退为
+//!   可升级读 → 降级为普通读”的整个过程中都靠它连续跟踪持锁者；
+//! - 读者领取通过状态字 CAS 完成并原子累加 `count_`，不取队列锁；
+//! - 读者释放只做原子减：减到 1 且组内有已领取的 `UpgrRead` 时，在组后继
+//!   预分配休眠升级写节点；减到 0 时由最后一个读者取一次队列锁，把整条读者链
+//!   批量归还 Arena；
+//! - 队列锁只保护主队列拓扑、封口标记与升级预留节点。
 //!
-//! 因此等待路径除 chunk 分配外不再发生堆分配，也不存在按固定容量分批唤醒
-//! 的锁往返。
+//! 因此等待路径除 chunk 分配外不再发生堆分配，也没有按节点逐个摘链的收尾。
 
 mod arena_;
 mod core_;
 mod reader_;
 mod rwlock_;
 mod upgrade_;
-mod wait_arena_;
+mod wait_node_;
 mod writer_;
 
 #[cfg(test)]

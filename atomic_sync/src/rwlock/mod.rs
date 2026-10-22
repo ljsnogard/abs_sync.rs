@@ -1,12 +1,11 @@
 //! 读写锁实现。
 //!
-//! [`cooperative`] 子模块在编译期二选一，对外 API 完全相同：
+//! [`cooperative`] 与 [`cooperative_arena`] 两套实现**同时编译**，对外 API
+//! 完全一致，由调用方按分配/性能特性选择，不再使用 Cargo feature 二选一：
 //!
-//! - 默认：等待队列使用 `VecDeque<Arc<WaitNode>>`（`cooperative/`）；
-//! - 启用 `cooperative-arena` feature：等待队列使用内部 `Arena` 承载节点，
-//!   节点之间是侵入式双向链表（`cooperative_arena/`）。
-//!
-//! feature 只在这里选择实现，不进入任一实现的内部代码。
+//! - `cooperative/`：等待队列使用 `VecDeque<Arc<WaitNode>>`；
+//! - `cooperative_arena/`：等待队列使用内部 `Arena<WaitNode>`，主队列与读者链
+//!   都是侵入式链表。
 
 mod error_;
 mod state_;

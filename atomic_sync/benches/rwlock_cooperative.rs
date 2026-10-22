@@ -24,10 +24,12 @@
 //! # 运行
 //!
 //! ```sh
-//! # 默认：堆分配等待队列
+//! # 测量堆分配等待队列
 //! cargo bench --bench rwlock_cooperative
-//! # 对照：Arena + 侵入式链表等待队列（对外 API 相同）
-//! cargo bench --features cooperative-arena --bench rwlock_cooperative
+//!
+//! # 测量 Arena + 侵入式主队列/读者链：把下面的
+//! # `cooperative::CooperativeRwLockOwned` 改成
+//! # `cooperative_arena::CooperativeRwLockOwned` 后重跑同一条命令。
 //! ```
 //!
 //! 规模可用环境变量调整：

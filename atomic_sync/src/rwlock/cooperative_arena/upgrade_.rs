@@ -30,6 +30,8 @@ use super::{
 /// 它在状态字上同时占一个读者名额与"可升级"标志；全锁至多存在一个。
 pub struct UpgradableReaderGuard<'a, 'g, T: ?Sized, D, B, O>(
     &'g mut CooperativeAcqSession<'a, T, D, B, O>,
+    /// 是否来自队列放行的读者组；决定释放时是否递减 RootRead.count。
+    bool,
 )
 where
     D: TrAtomicData + Unsigned,
@@ -42,8 +44,14 @@ where
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
 {
-    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
-        UpgradableReaderGuard(sess)
+    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>, tracked: bool) -> Self {
+        UpgradableReaderGuard(sess, tracked)
+    }
+
+    /// 是否跟踪读者组计数。
+    #[inline]
+    pub(super) fn tracked_(&self) -> bool {
+        self.1
     }
 
     /// 降级为普通读守卫。
@@ -75,7 +83,7 @@ where
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
-        self.0.core().release_upgradable_read()
+        self.0.core().release_upgradable_read(self.1)
     }
 }
 
@@ -194,6 +202,10 @@ where
         self.0.sess_ref()
     }
 
+    fn tracked_(&self) -> bool {
+        self.0.tracked_()
+    }
+
     fn share_guard_sess_mut(&mut self) -> &'g mut CooperativeAcqSession<'a, T, D, B, O> {
         self.0.share_mut()
     }
@@ -279,7 +291,7 @@ where
         };
 
         if this.pending_.is_none() && sess.core().try_upgradable_read_fast() {
-            return Poll::Ready(Result::Ok(UpgradableReaderGuard::new(sess)));
+            return Poll::Ready(Result::Ok(UpgradableReaderGuard::new(sess, false)));
         }
 
         let pending = this.pending_;
@@ -296,7 +308,7 @@ where
 
         if claimed {
             this.pending_ = Option::None;
-            Poll::Ready(Result::Ok(UpgradableReaderGuard::new(sess)))
+            Poll::Ready(Result::Ok(UpgradableReaderGuard::new(sess, true)))
         } else {
             this.sess_ = Option::Some(sess);
             Poll::Pending
@@ -516,7 +528,7 @@ where
         let pending = this.pending_;
         let claimed = match pending {
             Option::Some(pending) => core.poll_acquire(&pending, cx.waker()),
-            Option::None => match core.acquire(WaitKind::Upgrade, cx.waker()) {
+            Option::None => match core.acquire_upgrade(cx.waker(), upg.tracked_()) {
                 AcqProgress::Acquired => true,
                 AcqProgress::Waiting(pending) => {
                     this.pending_ = Option::Some(pending);

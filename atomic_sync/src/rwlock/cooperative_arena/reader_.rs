@@ -26,7 +26,11 @@ use super::{
 /// 读许可守卫。
 ///
 /// 它借用会话，因此同一会话在守卫存活期间不能再发起别的获取。
-pub struct ReaderGuard<'a, 'g, T: ?Sized, D, B, O>(&'g mut CooperativeAcqSession<'a, T, D, B, O>)
+pub struct ReaderGuard<'a, 'g, T: ?Sized, D, B, O>(
+    &'g mut CooperativeAcqSession<'a, T, D, B, O>,
+    /// 是否来自队列放行的读者组；决定释放时是否递减 RootRead.count。
+    bool,
+)
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
@@ -38,8 +42,8 @@ where
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
 {
-    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
-        ReaderGuard(sess)
+    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>, tracked: bool) -> Self {
+        ReaderGuard(sess, tracked)
     }
 }
 
@@ -50,7 +54,7 @@ where
     O: TrCmpxchOrderings,
 {
     fn drop(&mut self) {
-        self.0.core().release_reader()
+        self.0.core().release_reader(self.1)
     }
 }
 
@@ -134,7 +138,7 @@ where
 
         // 快速路径：无竞争时不分配节点、不加锁。
         if this.pending_.is_none() && sess.core().try_read_fast() {
-            return Poll::Ready(Result::Ok(ReaderGuard::new(sess)));
+            return Poll::Ready(Result::Ok(ReaderGuard::new(sess, false)));
         }
 
         let pending = this.pending_;
@@ -151,7 +155,7 @@ where
 
         if claimed {
             this.pending_ = Option::None;
-            Poll::Ready(Result::Ok(ReaderGuard::new(sess)))
+            Poll::Ready(Result::Ok(ReaderGuard::new(sess, true)))
         } else {
             this.sess_ = Option::Some(sess);
             Poll::Pending

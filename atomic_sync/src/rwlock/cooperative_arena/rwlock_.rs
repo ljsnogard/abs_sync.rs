@@ -70,7 +70,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use atomic_sync::rwlock::cooperative::CooperativeRwLockOwned;
+/// use atomic_sync::rwlock::cooperative_arena::CooperativeRwLockOwned;
 /// use atomic_sync::x_deps::abs_sync::async_rwlock::TrAsyncRwLock;
 ///
 /// let lock = CooperativeRwLockOwned::<usize>::new_owned(41);
@@ -209,7 +209,7 @@ where
     #[inline]
     pub fn try_read(&mut self) -> Result<ReaderGuard<'a, '_, T, D, B, O>, CoopRwLockError> {
         if self.0.core_.try_read_fast() {
-            Result::Ok(ReaderGuard::new(self))
+            Result::Ok(ReaderGuard::new(self, false))
         } else {
             Result::Err(CoopRwLockError::WouldBlock)
         }
@@ -229,7 +229,7 @@ where
         &mut self,
     ) -> Result<UpgradableReaderGuard<'a, '_, T, D, B, O>, CoopRwLockError> {
         if self.0.core_.try_upgradable_read_fast() {
-            Result::Ok(UpgradableReaderGuard::new(self))
+            Result::Ok(UpgradableReaderGuard::new(self, false))
         } else {
             Result::Err(CoopRwLockError::WouldBlock)
         }
@@ -293,7 +293,7 @@ where
     ) -> ReaderGuard<'a, 'g, T, D, B, O> {
         let sess = Self::destruct_guard_(guard);
         sess.core().downgrade_write_to_read();
-        ReaderGuard::new(sess)
+        ReaderGuard::new(sess, false)
     }
 
     pub(super) fn downgrade_writer_to_upgradable<'g>(
@@ -301,15 +301,16 @@ where
     ) -> UpgradableReaderGuard<'a, 'g, T, D, B, O> {
         let sess = Self::destruct_guard_(guard);
         sess.core().downgrade_write_to_upgradable();
-        UpgradableReaderGuard::new(sess)
+        UpgradableReaderGuard::new(sess, false)
     }
 
     pub(super) fn downgrade_upgradable_to_reader<'g>(
         guard: UpgradableReaderGuard<'a, 'g, T, D, B, O>,
     ) -> ReaderGuard<'a, 'g, T, D, B, O> {
+        let tracked = guard.tracked_();
         let sess = Self::destruct_guard_(guard);
-        sess.core().downgrade_upgradable_to_read();
-        ReaderGuard::new(sess)
+        sess.core().downgrade_upgradable_to_read(tracked);
+        ReaderGuard::new(sess, tracked)
     }
 
     #[allow(clippy::type_complexity)]

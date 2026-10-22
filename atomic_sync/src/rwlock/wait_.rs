@@ -1,7 +1,7 @@
 //! 协作式读写锁等待队列的共享底层构件：自旋锁与等待种类。
 //!
 //! 堆分配版自己的节点/槽位在 `cooperative/wait_node_` 中；Arena 版在
-//! `cooperative_arena/wait_arena_` 中。本模块只保留两边都要用的自旋锁与
+//! `cooperative_arena/wait_node_` 中。本模块只保留两边都要用的自旋锁与
 //! `WaitKind`。
 
 use core::{
