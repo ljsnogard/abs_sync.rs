@@ -1,5 +1,6 @@
 ﻿#![allow(unused_features)]
 #![feature(try_trait_v2)]
+#![feature(allocator_ext)]
 #![feature(impl_trait_in_assoc_type)]
 
 #![no_std]

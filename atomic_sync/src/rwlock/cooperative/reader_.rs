@@ -1,7 +1,8 @@
 //! 读许可的守卫与异步获取。
 
-use alloc::sync::Arc;
+use alloc::{alloc::Global, sync::Arc};
 use core::{
+    alloc::AllocatorClone,
     borrow::BorrowMut,
     future::{Future, IntoFuture},
     ops::Deref,
@@ -12,56 +13,57 @@ use core::{
 use funty::Unsigned;
 use pin_project::pin_project;
 
-use atomex::{x_deps::funty, TrAtomicData, TrCmpxchOrderings};
 use abs_cancel::{NonCancellableToken, TrCancellationToken, TrMayCancel};
 use abs_sync::{async_rwlock::*, sync_guard::TrAcqRefGuard, x_deps::abs_cancel};
+use atomex::{TrAtomicData, TrCmpxchOrderings, x_deps::funty};
 
 use super::wait_node_::WaitNode;
 
 use super::{core_::AcqProgress, rwlock_::CooperativeAcqSession};
-use crate::rwlock::{
-    error_::CoopRwLockError,
-    wait_::WaitKind,
-};
+use crate::rwlock::{error_::CoopRwLockError, wait_::WaitKind};
 
 /// 读许可守卫。
 ///
 /// 它借用会话，因此同一会话在守卫存活期间不能再发起别的获取。
-pub struct ReaderGuard<'a, 'g, T: ?Sized, D, B, O>(
-    &'g mut CooperativeAcqSession<'a, T, D, B, O>,
+pub struct ReaderGuard<'a, 'g, T: ?Sized, D, B, O, A = Global>(
+    &'g mut CooperativeAcqSession<'a, T, D, B, O, A>,
 )
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
-    O: TrCmpxchOrderings;
+    O: TrCmpxchOrderings,
+    A: AllocatorClone;
 
-impl<'a, 'g, T: ?Sized, D, B, O> ReaderGuard<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> ReaderGuard<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
+    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>) -> Self {
         ReaderGuard(sess)
     }
 }
 
-impl<'a, T: ?Sized, D, B, O> Drop for ReaderGuard<'a, '_, T, D, B, O>
+impl<'a, T: ?Sized, D, B, O, A> Drop for ReaderGuard<'a, '_, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     fn drop(&mut self) {
         self.0.core().release_reader()
     }
 }
 
-impl<'a, T: ?Sized, D, B, O> Deref for ReaderGuard<'a, '_, T, D, B, O>
+impl<'a, T: ?Sized, D, B, O, A> Deref for ReaderGuard<'a, '_, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     type Target = T;
 
@@ -71,25 +73,25 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> TrAcqRefGuard<'a, 'g, T>
-    for ReaderGuard<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> TrAcqRefGuard<'a, 'g, T> for ReaderGuard<'a, 'g, T, D, B, O, A>
 where
     'a: 'g,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> TrReaderGuard<'a, 'g, T>
-    for ReaderGuard<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> TrReaderGuard<'a, 'g, T> for ReaderGuard<'a, 'g, T, D, B, O, A>
 where
     'a: 'g,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    type Acquire = CooperativeAcqSession<'a, T, D, B, O>;
+    type Acquire = CooperativeAcqSession<'a, T, D, B, O, A>;
 }
 
 /// 手写的获取流程：入队、领取、注册 waker、以及取消时的出队。
@@ -98,23 +100,25 @@ where
 /// `Send` 自动特征可靠地渗透出去（rust#100013），会让
 /// `tokio::spawn(async { .. .write_async().await .. })` 直接编译不过；
 /// 具体类型则按字段结构自然地推导出 `Send`。
-pub(super) struct ReadAcquireInner<'a, 'g, T: ?Sized, D, B, O>
+pub(super) struct ReadAcquireInner<'a, 'g, T: ?Sized, D, B, O, A = Global>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    sess_: Option<&'g mut CooperativeAcqSession<'a, T, D, B, O>>,
-    pending_: Option<(Arc<WaitNode>, usize)>,
+    sess_: Option<&'g mut CooperativeAcqSession<'a, T, D, B, O, A>>,
+    pending_: Option<(Arc<WaitNode<A>, A>, usize)>,
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> ReadAcquireInner<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> ReadAcquireInner<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
+    fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>) -> Self {
         ReadAcquireInner {
             sess_: Option::Some(sess),
             pending_: Option::None,
@@ -122,13 +126,14 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> Future for ReadAcquireInner<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> Future for ReadAcquireInner<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    type Output = Result<ReaderGuard<'a, 'g, T, D, B, O>, CoopRwLockError>;
+    type Output = Result<ReaderGuard<'a, 'g, T, D, B, O, A>, CoopRwLockError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // 本类型所有字段都是 `Unpin`，取 `&mut self` 是安全的。
@@ -144,11 +149,8 @@ where
 
         let pending = this.pending_.clone();
         let claimed = match pending {
-            Option::Some((node, slot)) => {
-                sess.core().poll_acquire(&node, slot, cx.waker())
-            }
-            Option::None => match sess.core().acquire(WaitKind::Read, cx.waker())
-            {
+            Option::Some((node, slot)) => sess.core().poll_acquire(&node, slot, cx.waker()),
+            Option::None => match sess.core().acquire(WaitKind::Read, cx.waker()) {
                 AcqProgress::Acquired => true,
                 AcqProgress::Waiting { node_, slot_ } => {
                     this.pending_ = Option::Some((node_, slot_));
@@ -167,11 +169,12 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> Drop for ReadAcquireInner<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> Drop for ReadAcquireInner<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     fn drop(&mut self) {
         let (Option::Some(sess), Option::Some((node, slot))) =
@@ -187,44 +190,45 @@ where
 ///
 /// 它由 `read_async()` 返回：既可 `.await`（不可取消），也可先
 /// `.may_cancel_with(token)` 换成可取消的版本再 `.await`。
-pub struct ReadAcquireAsync<'a, 'g, T: ?Sized, D, B, O>
+pub struct ReadAcquireAsync<'a, 'g, T: ?Sized, D, B, O, A = Global>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    sess_: &'g mut CooperativeAcqSession<'a, T, D, B, O>,
+    sess_: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>,
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> ReadAcquireAsync<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> ReadAcquireAsync<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
+    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>) -> Self {
         ReadAcquireAsync { sess_: sess }
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> IntoFuture
-    for ReadAcquireAsync<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> IntoFuture for ReadAcquireAsync<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    type IntoFuture = ReadAcquireFuture<'a, 'g, T, D, B, O, NonCancellableToken>;
+    type IntoFuture = ReadAcquireFuture<'a, 'g, T, D, B, O, A, NonCancellableToken>;
 
-    type Output = Result<ReaderGuard<'a, 'g, T, D, B, O>, CoopRwLockError>;
+    type Output = Result<ReaderGuard<'a, 'g, T, D, B, O, A>, CoopRwLockError>;
 
     fn into_future(self) -> Self::IntoFuture {
         ReadAcquireFuture::new(self.sess_)
     }
 }
 
-impl<'f, 'a, 'g, T, D, B, O> TrMayCancel<'f>
-    for ReadAcquireAsync<'a, 'g, T, D, B, O>
+impl<'f, 'a, 'g, T, D, B, O, A> TrMayCancel<'f> for ReadAcquireAsync<'a, 'g, T, D, B, O, A>
 where
     'a: 'f,
     'g: 'f,
@@ -232,15 +236,16 @@ where
     D: TrAtomicData + Unsigned + 'f,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell> + 'f,
     O: TrCmpxchOrderings + 'f,
+    A: AllocatorClone + 'f,
 {
-    type MayCancelFuture<'lt, C> = ReadAcquireFuture<'a, 'g, T, D, B, O, C>
+    type MayCancelFuture<'lt, C>
+        = ReadAcquireFuture<'a, 'g, T, D, B, O, A, C>
     where
         'lt: 'f,
         Self: 'lt,
         C: 'lt + TrCancellationToken;
 
-    type MayCancelOutput =
-        Result<ReaderGuard<'a, 'g, T, D, B, O>, CoopRwLockError>;
+    type MayCancelOutput = Result<ReaderGuard<'a, 'g, T, D, B, O, A>, CoopRwLockError>;
 
     fn may_cancel_with<C>(self, cancel: C) -> Self::MayCancelFuture<'f, C>
     where
@@ -257,26 +262,28 @@ where
 /// 无法被证明（rust#100013），会让 `tokio::spawn(async { .. .write_async().await
 /// .. })` 编译不过。
 #[pin_project]
-pub struct ReadAcquireFuture<'a, 'g, T: ?Sized, D, B, O, C = NonCancellableToken>
+pub struct ReadAcquireFuture<'a, 'g, T: ?Sized, D, B, O, A = Global, C = NonCancellableToken>
 where
     C: TrCancellationToken,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    inner_: Option<ReadAcquireInner<'a, 'g, T, D, B, O>>,
+    inner_: Option<ReadAcquireInner<'a, 'g, T, D, B, O, A>>,
     #[pin]
     cancel_: Option<C::Cancellation>,
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> ReadAcquireFuture<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> ReadAcquireFuture<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     /// 不可取消的版本。
-    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
+    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>) -> Self {
         ReadAcquireFuture {
             inner_: Option::Some(ReadAcquireInner::new(sess)),
             cancel_: Option::None,
@@ -284,16 +291,17 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O, C> ReadAcquireFuture<'a, 'g, T, D, B, O, C>
+impl<'a, 'g, T: ?Sized, D, B, O, A, C> ReadAcquireFuture<'a, 'g, T, D, B, O, A, C>
 where
     C: TrCancellationToken,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     /// 可取消的版本。
     pub(super) fn with_cancel(
-        sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>,
+        sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>,
         cancel: C,
     ) -> Self {
         ReadAcquireFuture {
@@ -303,15 +311,15 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O, C> Future
-    for ReadAcquireFuture<'a, 'g, T, D, B, O, C>
+impl<'a, 'g, T: ?Sized, D, B, O, A, C> Future for ReadAcquireFuture<'a, 'g, T, D, B, O, A, C>
 where
     C: TrCancellationToken,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    type Output = Result<ReaderGuard<'a, 'g, T, D, B, O>, CoopRwLockError>;
+    type Output = Result<ReaderGuard<'a, 'g, T, D, B, O, A>, CoopRwLockError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();

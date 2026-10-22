@@ -1,6 +1,8 @@
 //! 写许可的守卫与异步获取。
 
+use alloc::alloc::Global;
 use core::{
+    alloc::AllocatorClone,
     borrow::BorrowMut,
     future::{Future, IntoFuture},
     ops::{Deref, DerefMut},
@@ -30,52 +32,58 @@ use super::{
 };
 
 /// 写许可守卫。
-pub struct WriterGuard<'a, 'g, T: ?Sized, D, B, O>(&'g mut CooperativeAcqSession<'a, T, D, B, O>)
-where
-    D: TrAtomicData + Unsigned,
-    B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
-    O: TrCmpxchOrderings;
-
-impl<'a, 'g, T: ?Sized, D, B, O> WriterGuard<'a, 'g, T, D, B, O>
+pub struct WriterGuard<'a, 'g, T: ?Sized, D, B, O, A = Global>(
+    &'g mut CooperativeAcqSession<'a, T, D, B, O, A>,
+)
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone;
+
+impl<'a, 'g, T: ?Sized, D, B, O, A> WriterGuard<'a, 'g, T, D, B, O, A>
+where
+    D: TrAtomicData + Unsigned,
+    B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
+    O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
+    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>) -> Self {
         WriterGuard(sess)
     }
 
     /// 降级为普通读守卫。
-    pub fn downgrade_to_reader(self) -> ReaderGuard<'a, 'g, T, D, B, O> {
+    pub fn downgrade_to_reader(self) -> ReaderGuard<'a, 'g, T, D, B, O, A> {
         CooperativeAcqSession::downgrade_writer_to_reader(self)
     }
 
     /// 降级为可升级读守卫。
-    pub fn downgrade_to_upgradable(self) -> UpgradableReaderGuard<'a, 'g, T, D, B, O> {
+    pub fn downgrade_to_upgradable(self) -> UpgradableReaderGuard<'a, 'g, T, D, B, O, A> {
         CooperativeAcqSession::downgrade_writer_to_upgradable(self)
     }
 }
 
-impl<'a, T: ?Sized, D, B, O> Drop for WriterGuard<'a, '_, T, D, B, O>
+impl<'a, T: ?Sized, D, B, O, A> Drop for WriterGuard<'a, '_, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     fn drop(&mut self) {
         self.0.core().release_writer()
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> TrShareMut<'g, CooperativeAcqSession<'a, T, D, B, O>>
-    for WriterGuard<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> TrShareMut<'g, CooperativeAcqSession<'a, T, D, B, O, A>>
+    for WriterGuard<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    fn share_mut(&mut self) -> &'g mut CooperativeAcqSession<'a, T, D, B, O> {
+    fn share_mut(&mut self) -> &'g mut CooperativeAcqSession<'a, T, D, B, O, A> {
         let p = self.0 as *mut _;
         // SAFETY: 守卫独占地持有会话借用（`&'g mut`），把它按原生命周期
         // 交还给调用方不会产生别名；调用方（`destruct_guard_`）会先用
@@ -84,11 +92,12 @@ where
     }
 }
 
-impl<'a, T: ?Sized, D, B, O> Deref for WriterGuard<'a, '_, T, D, B, O>
+impl<'a, T: ?Sized, D, B, O, A> Deref for WriterGuard<'a, '_, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     type Target = T;
 
@@ -98,11 +107,12 @@ where
     }
 }
 
-impl<'a, T: ?Sized, D, B, O> DerefMut for WriterGuard<'a, '_, T, D, B, O>
+impl<'a, T: ?Sized, D, B, O, A> DerefMut for WriterGuard<'a, '_, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
@@ -110,40 +120,44 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> TrAcqRefGuard<'a, 'g, T> for WriterGuard<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> TrAcqRefGuard<'a, 'g, T> for WriterGuard<'a, 'g, T, D, B, O, A>
 where
     'a: 'g,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> TrAcqMutGuard<'a, 'g, T> for WriterGuard<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> TrAcqMutGuard<'a, 'g, T> for WriterGuard<'a, 'g, T, D, B, O, A>
 where
     'a: 'g,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> TrReaderGuard<'a, 'g, T> for WriterGuard<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> TrReaderGuard<'a, 'g, T> for WriterGuard<'a, 'g, T, D, B, O, A>
 where
     'a: 'g,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    type Acquire = CooperativeAcqSession<'a, T, D, B, O>;
+    type Acquire = CooperativeAcqSession<'a, T, D, B, O, A>;
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> TrWriterGuard<'a, 'g, T> for WriterGuard<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> TrWriterGuard<'a, 'g, T> for WriterGuard<'a, 'g, T, D, B, O, A>
 where
     'a: 'g,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     #[inline]
     fn downgrade(self) -> <Self::Acquire as TrAsyncRwLockAcqSess<'a, T>>::ReaderGuard<'g> {
@@ -159,23 +173,25 @@ where
 }
 
 /// 手写的写者获取流程；结构同 [`super::reader_::ReadAcquireInner`]。
-pub(super) struct WriteAcquireInner<'a, 'g, T: ?Sized, D, B, O>
+pub(super) struct WriteAcquireInner<'a, 'g, T: ?Sized, D, B, O, A = Global>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    sess_: Option<&'g mut CooperativeAcqSession<'a, T, D, B, O>>,
+    sess_: Option<&'g mut CooperativeAcqSession<'a, T, D, B, O, A>>,
     pending_: Option<PendingWait>,
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> WriteAcquireInner<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> WriteAcquireInner<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
+    fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>) -> Self {
         WriteAcquireInner {
             sess_: Option::Some(sess),
             pending_: Option::None,
@@ -183,13 +199,14 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> Future for WriteAcquireInner<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> Future for WriteAcquireInner<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    type Output = Result<WriterGuard<'a, 'g, T, D, B, O>, CoopRwLockError>;
+    type Output = Result<WriterGuard<'a, 'g, T, D, B, O, A>, CoopRwLockError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -223,11 +240,12 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> Drop for WriteAcquireInner<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> Drop for WriteAcquireInner<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     fn drop(&mut self) {
         let (Option::Some(sess), Option::Some(pending)) =
@@ -240,42 +258,45 @@ where
 }
 
 /// 写获取的参数载体；用法见 [`super::reader_::ReadAcquireAsync`]。
-pub struct WriteAcquireAsync<'a, 'g, T: ?Sized, D, B, O>
+pub struct WriteAcquireAsync<'a, 'g, T: ?Sized, D, B, O, A = Global>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    sess_: &'g mut CooperativeAcqSession<'a, T, D, B, O>,
+    sess_: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>,
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> WriteAcquireAsync<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> WriteAcquireAsync<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
+    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>) -> Self {
         WriteAcquireAsync { sess_: sess }
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> IntoFuture for WriteAcquireAsync<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> IntoFuture for WriteAcquireAsync<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    type IntoFuture = WriteAcquireFuture<'a, 'g, T, D, B, O, NonCancellableToken>;
+    type IntoFuture = WriteAcquireFuture<'a, 'g, T, D, B, O, A, NonCancellableToken>;
 
-    type Output = Result<WriterGuard<'a, 'g, T, D, B, O>, CoopRwLockError>;
+    type Output = Result<WriterGuard<'a, 'g, T, D, B, O, A>, CoopRwLockError>;
 
     fn into_future(self) -> Self::IntoFuture {
         WriteAcquireFuture::new(self.sess_)
     }
 }
 
-impl<'f, 'a, 'g, T, D, B, O> TrMayCancel<'f> for WriteAcquireAsync<'a, 'g, T, D, B, O>
+impl<'f, 'a, 'g, T, D, B, O, A> TrMayCancel<'f> for WriteAcquireAsync<'a, 'g, T, D, B, O, A>
 where
     'a: 'f,
     'g: 'f,
@@ -283,15 +304,16 @@ where
     D: TrAtomicData + Unsigned + 'f,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell> + 'f,
     O: TrCmpxchOrderings + 'f,
+    A: AllocatorClone + 'f,
 {
     type MayCancelFuture<'lt, C>
-        = WriteAcquireFuture<'a, 'g, T, D, B, O, C>
+        = WriteAcquireFuture<'a, 'g, T, D, B, O, A, C>
     where
         'lt: 'f,
         Self: 'lt,
         C: 'lt + TrCancellationToken;
 
-    type MayCancelOutput = Result<WriterGuard<'a, 'g, T, D, B, O>, CoopRwLockError>;
+    type MayCancelOutput = Result<WriterGuard<'a, 'g, T, D, B, O, A>, CoopRwLockError>;
 
     fn may_cancel_with<C>(self, cancel: C) -> Self::MayCancelFuture<'f, C>
     where
@@ -303,25 +325,27 @@ where
 
 /// 写获取 future；见 [`super::reader_::ReadAcquireFuture`] 的说明。
 #[pin_project]
-pub struct WriteAcquireFuture<'a, 'g, T: ?Sized, D, B, O, C = NonCancellableToken>
+pub struct WriteAcquireFuture<'a, 'g, T: ?Sized, D, B, O, A = Global, C = NonCancellableToken>
 where
     C: TrCancellationToken,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    inner_: Option<WriteAcquireInner<'a, 'g, T, D, B, O>>,
+    inner_: Option<WriteAcquireInner<'a, 'g, T, D, B, O, A>>,
     #[pin]
     cancel_: Option<C::Cancellation>,
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O> WriteAcquireFuture<'a, 'g, T, D, B, O>
+impl<'a, 'g, T: ?Sized, D, B, O, A> WriteAcquireFuture<'a, 'g, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>) -> Self {
+    pub(super) fn new(sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>) -> Self {
         WriteAcquireFuture {
             inner_: Option::Some(WriteAcquireInner::new(sess)),
             cancel_: Option::None,
@@ -329,15 +353,16 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O, C> WriteAcquireFuture<'a, 'g, T, D, B, O, C>
+impl<'a, 'g, T: ?Sized, D, B, O, A, C> WriteAcquireFuture<'a, 'g, T, D, B, O, A, C>
 where
     C: TrCancellationToken,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     pub(super) fn with_cancel(
-        sess: &'g mut CooperativeAcqSession<'a, T, D, B, O>,
+        sess: &'g mut CooperativeAcqSession<'a, T, D, B, O, A>,
         cancel: C,
     ) -> Self {
         WriteAcquireFuture {
@@ -347,14 +372,15 @@ where
     }
 }
 
-impl<'a, 'g, T: ?Sized, D, B, O, C> Future for WriteAcquireFuture<'a, 'g, T, D, B, O, C>
+impl<'a, 'g, T: ?Sized, D, B, O, A, C> Future for WriteAcquireFuture<'a, 'g, T, D, B, O, A, C>
 where
     C: TrCancellationToken,
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    type Output = Result<WriterGuard<'a, 'g, T, D, B, O>, CoopRwLockError>;
+    type Output = Result<WriterGuard<'a, 'g, T, D, B, O, A>, CoopRwLockError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();

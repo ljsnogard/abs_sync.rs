@@ -1,7 +1,13 @@
 //! 协作式读写锁的外壳与会话。
 
-use alloc::sync::Arc;
-use core::{borrow::BorrowMut, cell::UnsafeCell, marker::PhantomPinned, sync::atomic::AtomicUsize};
+use alloc::{
+    alloc::{Allocator, Global},
+    sync::Arc,
+};
+use core::{
+    alloc::AllocatorClone, borrow::BorrowMut, cell::UnsafeCell, marker::PhantomPinned,
+    sync::atomic::AtomicUsize,
+};
 
 use funty::{Integral, Unsigned};
 
@@ -19,24 +25,45 @@ use super::{
 };
 
 /// 以"借用的原子单元"构造的协作式读写锁。
-pub type CooperativeRwLockBorrowed<'a, T, C = AtomicUsize, O = StrictOrderings> =
-    CooperativeRwLock<T, <C as TrAtomicCell>::Value, &'a mut C, O>;
+///
+/// 最后一个类型参数 `A` 是等待队列使用的分配器，默认 [`Global`]。
+pub type CooperativeRwLockBorrowed<'a, T, C = AtomicUsize, O = StrictOrderings, A = Global> =
+    CooperativeRwLock<T, <C as TrAtomicCell>::Value, &'a mut C, O, A>;
 
 /// 以"自有的原子单元"构造的协作式读写锁。
-pub type CooperativeRwLockOwned<T, C = AtomicUsize, O = StrictOrderings> =
-    CooperativeRwLock<T, <C as TrAtomicCell>::Value, C, O>;
+///
+/// 最后一个类型参数 `A` 是等待队列使用的分配器，默认 [`Global`]。
+pub type CooperativeRwLockOwned<T, C = AtomicUsize, O = StrictOrderings, A = Global> =
+    CooperativeRwLock<T, <C as TrAtomicCell>::Value, C, O, A>;
 
-impl<T, C, O> CooperativeRwLockOwned<T, C, O>
+impl<T, C, O, A> CooperativeRwLockOwned<T, C, O, A>
 where
     C: TrAtomicCell,
     <C as TrAtomicCell>::Value: TrAtomicData<AtomicCell = C> + Unsigned,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
+    A: AllocatorClone + Default,
 {
-    /// 用默认（清零）状态字构造。
+    /// 用默认（清零）状态字与默认分配器构造。
     pub fn new_owned(data: T) -> Self {
         let val = <<C as TrAtomicCell>::Value as Integral>::ZERO;
         let cell = <C as TrAtomicCell>::new(val);
-        CooperativeRwLockOwned::<T, C, O>::new(data, cell)
+        CooperativeRwLockOwned::<T, C, O, A>::new(data, cell)
+    }
+}
+
+impl<T, C, O, A> CooperativeRwLockOwned<T, C, O, A>
+where
+    C: TrAtomicCell,
+    <C as TrAtomicCell>::Value: TrAtomicData<AtomicCell = C> + Unsigned,
+    O: TrCmpxchOrderings,
+    A: AllocatorClone,
+{
+    /// 用默认（清零）状态字与给定分配器构造。
+    pub fn new_owned_in(data: T, alloc: A) -> Self {
+        let val = <<C as TrAtomicCell>::Value as Integral>::ZERO;
+        let cell = <C as TrAtomicCell>::new(val);
+        CooperativeRwLockOwned::<T, C, O, A>::new_in(data, cell, alloc)
     }
 }
 
@@ -45,6 +72,12 @@ where
 /// 它把被保护的资源 `T` 内联持有（`T: ?Sized` 时作为最后一个字段），
 /// 而把全部同步状态放在 `Arc<RwCore<..>>` 里。`RwCore` 不泛型于 `T`，
 /// 因此自身 `Sized` 且大小固定。
+///
+/// # 分配器
+///
+/// 最后一个类型参数 `A`（默认 [`Global`]）用于等待队列与共享内核 `Arc` 的
+/// 分配。`new` / `new_owned` 使用 `A::default()`；带状态的分配器请改用
+/// `new_in` / `new_owned_in`。
 ///
 /// # 公平性
 ///
@@ -82,28 +115,48 @@ where
 /// let r = sess.try_read().unwrap();
 /// assert_eq!(*r, 42);
 /// ```
-pub struct CooperativeRwLock<T: ?Sized, D = usize, B = AtomicUsize, O = StrictOrderings>
-where
+pub struct CooperativeRwLock<
+    T: ?Sized,
+    D = usize,
+    B = AtomicUsize,
+    O = StrictOrderings,
+    A: Allocator = Global,
+> where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     _pin_: PhantomPinned,
-    core_: Arc<RwCore<D, B, O>>,
+    core_: Arc<RwCore<D, B, O, A>, A>,
     data_: UnsafeCell<T>,
 }
 
-impl<T, D, B, O> CooperativeRwLock<T, D, B, O>
+impl<T, D, B, O, A> CooperativeRwLock<T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone + Default,
 {
-    /// 用给定的原子单元构造；`cell` 的初值必须是零（空闲状态）。
+    /// 用给定的原子单元与默认分配器构造；`cell` 的初值必须是零（空闲状态）。
     pub fn new(data: T, cell: B) -> Self {
+        Self::new_in(data, cell, A::default())
+    }
+}
+
+impl<T, D, B, O, A> CooperativeRwLock<T, D, B, O, A>
+where
+    D: TrAtomicData + Unsigned,
+    B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
+    O: TrCmpxchOrderings,
+    A: AllocatorClone,
+{
+    /// 用给定的原子单元与分配器构造；`cell` 的初值必须是零（空闲状态）。
+    pub fn new_in(data: T, cell: B, alloc: A) -> Self {
         CooperativeRwLock {
             _pin_: PhantomPinned,
-            core_: Arc::new(RwCore::new(cell)),
+            core_: Arc::new_in(RwCore::new_in(cell, alloc.clone()), alloc),
             data_: UnsafeCell::new(data),
         }
     }
@@ -116,14 +169,15 @@ where
     }
 }
 
-impl<T: ?Sized, D, B, O> CooperativeRwLock<T, D, B, O>
+impl<T: ?Sized, D, B, O, A> CooperativeRwLock<T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     /// 建立一个会话。
-    pub const fn acquire_session(&self) -> CooperativeAcqSession<'_, T, D, B, O> {
+    pub const fn acquire_session(&self) -> CooperativeAcqSession<'_, T, D, B, O, A> {
         CooperativeAcqSession::new(self)
     }
 
@@ -147,16 +201,17 @@ where
     }
 }
 
-impl<T: ?Sized, D, B, O> TrAsyncRwLock for CooperativeRwLock<T, D, B, O>
+impl<T: ?Sized, D, B, O, A> TrAsyncRwLock for CooperativeRwLock<T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     type Target = T;
 
     type AcqSess<'f>
-        = CooperativeAcqSession<'f, T, D, B, O>
+        = CooperativeAcqSession<'f, T, D, B, O, A>
     where
         Self: 'f;
 
@@ -171,43 +226,49 @@ where
 // SAFETY: 与 `std::sync::RwLock` 相同的论证：只要 `T: Send + Sync`，
 // 跨线程共享本锁、以及把锁的所有权搬到别的线程都是安全的；
 // 独占访问由状态字保证。
-unsafe impl<T: ?Sized + Send, D, B, O> Send for CooperativeRwLock<T, D, B, O>
+unsafe impl<T: ?Sized + Send, D, B, O, A> Send for CooperativeRwLock<T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell> + Send,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
 }
 
 // SAFETY: 见上。
-unsafe impl<T: ?Sized + Send + Sync, D, B, O> Sync for CooperativeRwLock<T, D, B, O>
+unsafe impl<T: ?Sized + Send + Sync, D, B, O, A> Sync for CooperativeRwLock<T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell> + Sync,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
 }
 
 /// 一次上锁会话：它只是外壳的借用，本身不持有任何状态。
-pub struct CooperativeAcqSession<'a, T: ?Sized, D, B, O>(&'a CooperativeRwLock<T, D, B, O>)
-where
-    D: TrAtomicData + Unsigned,
-    B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
-    O: TrCmpxchOrderings;
-
-impl<'a, T: ?Sized, D, B, O> CooperativeAcqSession<'a, T, D, B, O>
+pub struct CooperativeAcqSession<'a, T: ?Sized, D, B, O, A = Global>(
+    &'a CooperativeRwLock<T, D, B, O, A>,
+)
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone;
+
+impl<'a, T: ?Sized, D, B, O, A> CooperativeAcqSession<'a, T, D, B, O, A>
+where
+    D: TrAtomicData + Unsigned,
+    B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
+    O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     #[inline]
-    pub const fn new(lock: &'a CooperativeRwLock<T, D, B, O>) -> Self {
+    pub const fn new(lock: &'a CooperativeRwLock<T, D, B, O, A>) -> Self {
         CooperativeAcqSession(lock)
     }
 
     #[inline]
-    pub fn try_read(&mut self) -> Result<ReaderGuard<'a, '_, T, D, B, O>, CoopRwLockError> {
+    pub fn try_read(&mut self) -> Result<ReaderGuard<'a, '_, T, D, B, O, A>, CoopRwLockError> {
         if self.0.core_.try_read_fast() {
             Result::Ok(ReaderGuard::new(self, false))
         } else {
@@ -216,7 +277,7 @@ where
     }
 
     #[inline]
-    pub fn try_write(&mut self) -> Result<WriterGuard<'a, '_, T, D, B, O>, CoopRwLockError> {
+    pub fn try_write(&mut self) -> Result<WriterGuard<'a, '_, T, D, B, O, A>, CoopRwLockError> {
         if self.0.core_.try_write_fast() {
             Result::Ok(WriterGuard::new(self))
         } else {
@@ -227,7 +288,7 @@ where
     #[inline]
     pub fn try_upgradable_read(
         &mut self,
-    ) -> Result<UpgradableReaderGuard<'a, '_, T, D, B, O>, CoopRwLockError> {
+    ) -> Result<UpgradableReaderGuard<'a, '_, T, D, B, O, A>, CoopRwLockError> {
         if self.0.core_.try_upgradable_read_fast() {
             Result::Ok(UpgradableReaderGuard::new(self, false))
         } else {
@@ -236,7 +297,7 @@ where
     }
 
     #[inline]
-    pub fn read_async<'g>(&'g mut self) -> ReadAcquireAsync<'a, 'g, T, D, B, O>
+    pub fn read_async<'g>(&'g mut self) -> ReadAcquireAsync<'a, 'g, T, D, B, O, A>
     where
         'a: 'g,
     {
@@ -244,7 +305,7 @@ where
     }
 
     #[inline]
-    pub fn write_async<'g>(&'g mut self) -> WriteAcquireAsync<'a, 'g, T, D, B, O>
+    pub fn write_async<'g>(&'g mut self) -> WriteAcquireAsync<'a, 'g, T, D, B, O, A>
     where
         'a: 'g,
     {
@@ -252,7 +313,9 @@ where
     }
 
     #[inline]
-    pub fn upgradable_read_async<'g>(&'g mut self) -> UpgradableReadAcquireAsync<'a, 'g, T, D, B, O>
+    pub fn upgradable_read_async<'g>(
+        &'g mut self,
+    ) -> UpgradableReadAcquireAsync<'a, 'g, T, D, B, O, A>
     where
         'a: 'g,
     {
@@ -260,14 +323,15 @@ where
     }
 }
 
-impl<'a, T: ?Sized, D, B, O> CooperativeAcqSession<'a, T, D, B, O>
+impl<'a, T: ?Sized, D, B, O, A> CooperativeAcqSession<'a, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     #[inline]
-    pub(super) fn core(&self) -> &RwCore<D, B, O> {
+    pub(super) fn core(&self) -> &RwCore<D, B, O, A> {
         &self.0.core_
     }
 
@@ -289,24 +353,24 @@ where
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
     pub(super) fn downgrade_writer_to_reader<'g>(
-        guard: WriterGuard<'a, 'g, T, D, B, O>,
-    ) -> ReaderGuard<'a, 'g, T, D, B, O> {
+        guard: WriterGuard<'a, 'g, T, D, B, O, A>,
+    ) -> ReaderGuard<'a, 'g, T, D, B, O, A> {
         let sess = Self::destruct_guard_(guard);
         sess.core().downgrade_write_to_read();
         ReaderGuard::new(sess, false)
     }
 
     pub(super) fn downgrade_writer_to_upgradable<'g>(
-        guard: WriterGuard<'a, 'g, T, D, B, O>,
-    ) -> UpgradableReaderGuard<'a, 'g, T, D, B, O> {
+        guard: WriterGuard<'a, 'g, T, D, B, O, A>,
+    ) -> UpgradableReaderGuard<'a, 'g, T, D, B, O, A> {
         let sess = Self::destruct_guard_(guard);
         sess.core().downgrade_write_to_upgradable();
         UpgradableReaderGuard::new(sess, false)
     }
 
     pub(super) fn downgrade_upgradable_to_reader<'g>(
-        guard: UpgradableReaderGuard<'a, 'g, T, D, B, O>,
-    ) -> ReaderGuard<'a, 'g, T, D, B, O> {
+        guard: UpgradableReaderGuard<'a, 'g, T, D, B, O, A>,
+    ) -> ReaderGuard<'a, 'g, T, D, B, O, A> {
         let tracked = guard.tracked_();
         let sess = Self::destruct_guard_(guard);
         sess.core().downgrade_upgradable_to_read(tracked);
@@ -315,9 +379,10 @@ where
 
     #[allow(clippy::type_complexity)]
     pub(super) fn try_upgrade_to_writer<'g>(
-        mut guard: UpgradableReaderGuard<'a, 'g, T, D, B, O>,
-    ) -> Result<WriterGuard<'a, 'g, T, D, B, O>, UpgradableReaderGuard<'a, 'g, T, D, B, O>> {
-        let guard_ptr = &mut guard as *mut UpgradableReaderGuard<'a, 'g, T, D, B, O>;
+        mut guard: UpgradableReaderGuard<'a, 'g, T, D, B, O, A>,
+    ) -> Result<WriterGuard<'a, 'g, T, D, B, O, A>, UpgradableReaderGuard<'a, 'g, T, D, B, O, A>>
+    {
+        let guard_ptr = &mut guard as *mut UpgradableReaderGuard<'a, 'g, T, D, B, O, A>;
         // SAFETY: `guard` 在本次调用中不会被移动（比较失败时原样返回），
         // 因此这里的可变借用是独占且有效的。
         if let Result::Ok(g) = Self::try_upgrade_mut_to_writer(unsafe { &mut *guard_ptr }) {
@@ -328,8 +393,8 @@ where
     }
 
     pub(super) fn try_upgrade_mut_to_writer<'g, 'u>(
-        guard: &'u mut UpgradableReaderGuard<'a, 'g, T, D, B, O>,
-    ) -> Result<WriterGuard<'a, 'u, T, D, B, O>, CoopRwLockError> {
+        guard: &'u mut UpgradableReaderGuard<'a, 'g, T, D, B, O, A>,
+    ) -> Result<WriterGuard<'a, 'u, T, D, B, O, A>, CoopRwLockError> {
         let sess = guard.share_mut();
         if sess.core().try_upgrade_now() {
             Result::Ok(WriterGuard::new(sess))
@@ -350,24 +415,26 @@ where
     }
 }
 
-impl<'a, T: ?Sized, D, B, O> TrAsyncRwLockAcqSess<'a, T> for CooperativeAcqSession<'a, T, D, B, O>
+impl<'a, T: ?Sized, D, B, O, A> TrAsyncRwLockAcqSess<'a, T>
+    for CooperativeAcqSession<'a, T, D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
     type ReaderGuard<'g>
-        = ReaderGuard<'a, 'g, T, D, B, O>
+        = ReaderGuard<'a, 'g, T, D, B, O, A>
     where
         'a: 'g;
 
     type WriterGuard<'g>
-        = WriterGuard<'a, 'g, T, D, B, O>
+        = WriterGuard<'a, 'g, T, D, B, O, A>
     where
         'a: 'g;
 
     type UpgradableGuard<'g>
-        = UpgradableReaderGuard<'a, 'g, T, D, B, O>
+        = UpgradableReaderGuard<'a, 'g, T, D, B, O, A>
     where
         'a: 'g;
 
@@ -398,7 +465,7 @@ where
     }
 
     type ReadAsync<'f>
-        = ReadAcquireAsync<'a, 'f, T, D, B, O>
+        = ReadAcquireAsync<'a, 'f, T, D, B, O, A>
     where
         'a: 'f;
 
@@ -411,7 +478,7 @@ where
     }
 
     type WriteAsync<'f>
-        = WriteAcquireAsync<'a, 'f, T, D, B, O>
+        = WriteAcquireAsync<'a, 'f, T, D, B, O, A>
     where
         'a: 'f;
 
@@ -424,7 +491,7 @@ where
     }
 
     type UpgradableReadAsync<'f>
-        = UpgradableReadAcquireAsync<'a, 'f, T, D, B, O>
+        = UpgradableReadAcquireAsync<'a, 'f, T, D, B, O, A>
     where
         'a: 'f;
 

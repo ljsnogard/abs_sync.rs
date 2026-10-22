@@ -18,7 +18,7 @@
 //!   统一回收空组。
 //! - 升级请求只有在真正发起时才插入 `PureWrite(Upgrade)`；不做预留。
 
-use alloc::alloc::{Global, handle_alloc_error};
+use alloc::alloc::{Allocator, Global, handle_alloc_error};
 use core::{borrow::BorrowMut, hint, ptr::NonNull, sync::atomic::AtomicPtr, task::Waker};
 
 use funty::Unsigned;
@@ -61,7 +61,7 @@ pub(super) enum AcqProgress {
 }
 
 /// 队列自旋锁保护的载荷。
-struct QueuePayload {
+struct QueuePayload<A: Allocator> {
     /// 主队列队首。
     head_: Option<NonNull<WaitNode>>,
     /// 主队列队尾。
@@ -69,13 +69,13 @@ struct QueuePayload {
     /// 队列中仍处于待决状态的 `Write` / `Upgrade` 请求数。
     writer_waiters_: usize,
     /// 等待节点池。
-    arena_: Arena<WaitNode>,
+    arena_: Arena<WaitNode, A>,
 }
 
 // SAFETY: `head_` / `tail_` 只指向同一个 `arena_` 拥有的元素。移动
 // `QueuePayload` 时 `Arena` 与链接一起移动，元素地址不变；所有链接读写都在
 // 队列自旋锁内完成。Arena 自身在 `WaitNode: Send` 时满足 `Send`。
-unsafe impl Send for QueuePayload {}
+unsafe impl<A: Allocator + Send> Send for QueuePayload<A> {}
 
 /// 一次选中的放行目标。
 enum Selection {
@@ -96,7 +96,7 @@ enum WakeAction {
 }
 
 /// Arena 版读写锁的共享内核。
-pub(super) struct RwCoreArena<D, B, O = StrictOrderings>
+pub(super) struct RwCoreArena<D, B, O = StrictOrderings, A: Allocator = Global>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
@@ -105,16 +105,30 @@ where
     stat_: CoopRwState<D, B, O>,
     /// 当前唯一活跃读者组的根；快速路径读者不参与。
     active_read_group_: AtomexPtr<WaitNode>,
-    queue_: SpinLock<QueuePayload>,
+    queue_: SpinLock<QueuePayload<A>>,
 }
 
-impl<D, B, O> RwCoreArena<D, B, O>
+impl<D, B, O> RwCoreArena<D, B, O, Global>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
 {
-    pub(super) const fn new(cell: B) -> Self {
+    /// 用全局分配器构造；保留给内部测试与默认路径使用。
+    #[cfg(test)]
+    pub(super) fn new(cell: B) -> Self {
+        Self::new_in(cell, Global)
+    }
+}
+
+impl<D, B, O, A> RwCoreArena<D, B, O, A>
+where
+    D: TrAtomicData + Unsigned,
+    B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
+    O: TrCmpxchOrderings,
+    A: Allocator,
+{
+    pub(super) fn new_in(cell: B, alloc: A) -> Self {
         RwCoreArena {
             stat_: CoopRwState::new(cell),
             active_read_group_: AtomexPtr::new(AtomicPtr::new(core::ptr::null_mut())),
@@ -122,7 +136,7 @@ where
                 head_: Option::None,
                 tail_: Option::None,
                 writer_waiters_: 0,
-                arena_: Arena::new(Global),
+                arena_: Arena::new(alloc),
             }),
         }
     }
@@ -260,7 +274,7 @@ where
     }
 
     /// 读者入队后、仍持有队列锁时尝试直接领取。
-    fn try_claim_reader_locked_(&self, q: &mut QueuePayload, pending: &PendingWait) -> bool {
+    fn try_claim_reader_locked_(&self, q: &mut QueuePayload<A>, pending: &PendingWait) -> bool {
         // SAFETY: `pending.node_` 刚由本队列创建，仍然存活。
         let node = unsafe { pending.node_.as_ref() };
         let reader = node.as_reader_();
@@ -424,7 +438,7 @@ where
     // 入队
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    fn enqueue_(&self, q: &mut QueuePayload, kind: WaitKind) -> PendingWait {
+    fn enqueue_(&self, q: &mut QueuePayload<A>, kind: WaitKind) -> PendingWait {
         if kind.is_readish() {
             return self.enqueue_reader_(q, kind);
         }
@@ -434,7 +448,7 @@ where
         self.enqueue_write_(q)
     }
 
-    fn enqueue_reader_(&self, q: &mut QueuePayload, kind: WaitKind) -> PendingWait {
+    fn enqueue_reader_(&self, q: &mut QueuePayload<A>, kind: WaitKind) -> PendingWait {
         if let Option::Some(tail) = q.tail_ {
             // SAFETY: `tail` 是本队列中仍然存活的节点。
             let tail_node = unsafe { tail.as_ref() };
@@ -474,7 +488,7 @@ where
         }
     }
 
-    fn enqueue_write_(&self, q: &mut QueuePayload) -> PendingWait {
+    fn enqueue_write_(&self, q: &mut QueuePayload<A>) -> PendingWait {
         let node = self.alloc_node_(q, WaitNode::new_write(WaitKind::Write, Option::None));
         self.push_back_(q, node);
         // SAFETY: 持有队列锁。
@@ -486,7 +500,7 @@ where
         }
     }
 
-    fn enqueue_upgrade_front_(&self, q: &mut QueuePayload) -> PendingWait {
+    fn enqueue_upgrade_front_(&self, q: &mut QueuePayload<A>) -> PendingWait {
         let node = self.alloc_node_(q, WaitNode::new_write(WaitKind::Upgrade, Option::None));
         self.push_front_(q, node);
         // SAFETY: 持有队列锁。
@@ -500,7 +514,7 @@ where
 
     fn enqueue_upgrade_in_group_(
         &self,
-        q: &mut QueuePayload,
+        q: &mut QueuePayload<A>,
         group: NonNull<WaitNode>,
     ) -> PendingWait {
         let node = self.alloc_node_(
@@ -518,7 +532,7 @@ where
     }
 
     /// 尝试对刚入队的写者/升级节点直接领取。
-    fn try_claim_enqueued_(&self, q: &mut QueuePayload, pending: &PendingWait) -> bool {
+    fn try_claim_enqueued_(&self, q: &mut QueuePayload<A>, pending: &PendingWait) -> bool {
         // SAFETY: `pending.node_` 刚由本队列创建，仍然存活。
         let node = unsafe { pending.node_.as_ref() };
         let write = node.as_write_();
@@ -590,7 +604,7 @@ where
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
     /// 回收队首已经没有任何持锁者/等待者的读者组。
-    fn prune_front_(&self, q: &mut QueuePayload) {
+    fn prune_front_(&self, q: &mut QueuePayload<A>) {
         loop {
             let Option::Some(front) = q.head_ else {
                 return;
@@ -619,7 +633,7 @@ where
     }
 
     /// 在队列锁内选出可以放行的目标。
-    fn select_head_(&self, q: &mut QueuePayload) -> Option<Selection> {
+    fn select_head_(&self, q: &mut QueuePayload<A>) -> Option<Selection> {
         let Option::Some(front) = q.head_ else {
             self.stat_.clear_waiters_present();
             if q.writer_waiters_ != 0 {
@@ -794,7 +808,7 @@ where
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
     /// 释放一个已领取/已取消的写者节点，并维护计数。
-    fn finish_write_node_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
+    fn finish_write_node_(&self, q: &mut QueuePayload<A>, node: NonNull<WaitNode>) {
         // SAFETY: `node` 是主队列中仍然存活的写者节点。
         let write = unsafe { node.as_ref() }.as_write_();
         if write.counted_() {
@@ -811,7 +825,7 @@ where
     }
 
     /// 批量回收整个空读者组：读者链节点与根节点。
-    fn free_group_(&self, q: &mut QueuePayload, group: NonNull<WaitNode>) {
+    fn free_group_(&self, q: &mut QueuePayload<A>, group: NonNull<WaitNode>) {
         // SAFETY: `group` 是主队列中仍然存活的读者组。
         let root = unsafe { group.as_ref() }.as_root_read_();
         debug_assert_eq!(root.count_(), 0, "回收仍有持锁者的读者组");
@@ -840,7 +854,7 @@ where
     // 主队列链接
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    fn push_back_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
+    fn push_back_(&self, q: &mut QueuePayload<A>, node: NonNull<WaitNode>) {
         let old_tail = q.tail_;
         // SAFETY: `node` 是刚分配、尚未入链的节点；持有队列锁。
         unsafe {
@@ -855,7 +869,7 @@ where
         q.tail_ = Option::Some(node);
     }
 
-    fn push_front_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
+    fn push_front_(&self, q: &mut QueuePayload<A>, node: NonNull<WaitNode>) {
         let old_head = q.head_;
         // SAFETY: `node` 是刚分配、尚未入链的节点；持有队列锁。
         unsafe {
@@ -870,7 +884,12 @@ where
         q.head_ = Option::Some(node);
     }
 
-    fn insert_after_(&self, q: &mut QueuePayload, at: NonNull<WaitNode>, node: NonNull<WaitNode>) {
+    fn insert_after_(
+        &self,
+        q: &mut QueuePayload<A>,
+        at: NonNull<WaitNode>,
+        node: NonNull<WaitNode>,
+    ) {
         // SAFETY: `at` 是主队列中仍然存活的节点；`node` 尚未入链。
         let next = unsafe { at.as_ref().next_() };
         unsafe {
@@ -886,7 +905,7 @@ where
     }
 
     /// 从主队列摘除一个确定仍然在链上的节点。
-    fn unlink_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
+    fn unlink_(&self, q: &mut QueuePayload<A>, node: NonNull<WaitNode>) {
         // SAFETY: `node` 是主队列中仍然存活的节点；持有队列锁。
         let prev = unsafe { node.as_ref().prev_() };
         let next = unsafe { node.as_ref().next_() };
@@ -911,14 +930,14 @@ where
     // Arena 分配 / 活跃组指针
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    fn alloc_node_(&self, q: &mut QueuePayload, node: WaitNode) -> NonNull<WaitNode> {
+    fn alloc_node_(&self, q: &mut QueuePayload<A>, node: WaitNode) -> NonNull<WaitNode> {
         match q.arena_.alloc(node) {
             Result::Ok(node) => node,
             Result::Err(_) => handle_alloc_error(Arena::<WaitNode>::chunk_layout()),
         }
     }
 
-    fn free_node_(&self, q: &mut QueuePayload, node: NonNull<WaitNode>) {
+    fn free_node_(&self, q: &mut QueuePayload<A>, node: NonNull<WaitNode>) {
         // SAFETY: `node` 已经脱链，且没有其他存活引用。
         drop(unsafe { q.arena_.free(node) });
     }
@@ -944,7 +963,7 @@ where
     // 计数
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
-    fn note_exclusive_queued_(&self, q: &mut QueuePayload) {
+    fn note_exclusive_queued_(&self, q: &mut QueuePayload<A>) {
         q.writer_waiters_ += 1;
         if q.writer_waiters_ == 1 {
             self.stat_.mark_writer_queued();
@@ -1067,7 +1086,9 @@ mod tests_ {
         let group_a = unsafe { pending_a.node_.as_ref() }.as_reader_().root_();
         // SAFETY: 组 A 仍存活。
         assert!(
-            unsafe { group_a.as_ref() }.as_root_read_().try_set_waking_(),
+            unsafe { group_a.as_ref() }
+                .as_root_read_()
+                .try_set_waking_(),
             "首次置位 WAKING 应成功"
         );
 
@@ -1099,7 +1120,10 @@ mod tests_ {
         );
 
         core.release_writer();
-        assert!(core.poll_acquire(&pending_b, waker), "释放写者后 B 应能领取");
+        assert!(
+            core.poll_acquire(&pending_b, waker),
+            "释放写者后 B 应能领取"
+        );
         core.release_reader(true);
         assert!(!core.waiters_present(), "最终队列应为空");
         assert!(core.pool_is_empty(), "最终 Arena 应为空");

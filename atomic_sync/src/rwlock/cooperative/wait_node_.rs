@@ -1,6 +1,6 @@
 //! 堆分配队列版等待节点：每个节点用一个 `Vec<WaiterSlot>` 承载槽位。
 
-use alloc::vec::Vec;
+use alloc::{alloc::Allocator, vec::Vec};
 use core::task::Waker;
 
 use crate::rwlock::wait_::{SpinLock, WaitKind};
@@ -45,12 +45,12 @@ struct WaiterSlot {
 ///
 /// 节点槽位由自身的自旋锁保护；调用方（`core_`）总是**先持有队列锁、再取
 /// 节点锁**，锁序固定为 `队列锁 → 节点锁`，不会成环。
-pub(super) struct WaitNode {
+pub(super) struct WaitNode<A: Allocator> {
     readish_: bool,
-    slots_: SpinLock<Vec<WaiterSlot>>,
+    slots_: SpinLock<Vec<WaiterSlot, A>>,
 }
 
-fn push_slot_into_(slots: &mut Vec<WaiterSlot>, kind: WaitKind) -> usize {
+fn push_slot_into_<A: Allocator>(slots: &mut Vec<WaiterSlot, A>, kind: WaitKind) -> usize {
     slots.push(WaiterSlot {
         kind_: kind,
         waker_: None,
@@ -59,12 +59,15 @@ fn push_slot_into_(slots: &mut Vec<WaiterSlot>, kind: WaitKind) -> usize {
     slots.len() - 1
 }
 
-impl WaitNode {
+impl<A: Allocator> WaitNode<A> {
     /// 建立只带一个槽位的新节点，返回 (节点, 槽位下标)。
-    pub(super) fn new(kind: WaitKind) -> (Self, usize) {
+    ///
+    /// `alloc` 用于节点内部的槽位 `Vec`；节点本身由调用方用同一分配器
+    /// 放进 `Arc`。
+    pub(super) fn new(kind: WaitKind, alloc: A) -> (Self, usize) {
         let node = WaitNode {
             readish_: kind.is_readish(),
-            slots_: SpinLock::new(Vec::new()),
+            slots_: SpinLock::new(Vec::new_in(alloc)),
         };
         node.slots_.lock().push(WaiterSlot {
             kind_: kind,
@@ -161,7 +164,7 @@ impl WaitNode {
     /// 跨线程调度，是 8 线程下性能崩塌的主因。
     pub(super) fn admit_waiting(
         &self,
-        out: &mut Vec<Waker>,
+        out: &mut Vec<Waker, A>,
         mut allow: impl FnMut(WaitKind) -> bool,
     ) {
         let mut slots = self.slots_.lock();
