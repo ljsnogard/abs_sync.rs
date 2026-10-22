@@ -41,3 +41,22 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"
 [[bench]]
 name = "rwlock_cooperative"
 harness = false
+
+# 双实现对比基准：两个 target 共用 `benches/common/rwlock_compare_common.rs`，各自只定义
+# `impl_mod` 与 `TestLock`，因此同一份负载源码会分别编译进两个二进制。
+[[bench]]
+name = "rwlock_compare_heap"
+harness = false
+
+[[bench]]
+name = "rwlock_compare_arena"
+harness = false
+
+# 分配计数基准：安装计数型全局分配器，断言两版稳态分配差异。
+[[bench]]
+name = "rwlock_alloc_heap"
+harness = false
+
+[[bench]]
+name = "rwlock_alloc_arena"
+harness = false

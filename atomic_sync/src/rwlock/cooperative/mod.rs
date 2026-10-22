@@ -22,6 +22,11 @@
 //! 等待队列，因此自身 `Sized` 且大小固定。Guard 通过"借用会话、会话借用
 //! 外壳"的路径访问数据，全程类型安全。
 //!
+//! # 分配器
+//!
+//! 锁的最后一个类型参数 `A` 是等待队列使用的分配器，默认 [`alloc::alloc::Global`]；
+//! 带状态的分配器可通过 `new_in` / `new_owned_in` 传入。
+//!
 //! # 并发模型
 //!
 //! - 快速路径在"没有写者持有、且队列里没有写者/升级等待者"时直接比较交换状态字，
@@ -40,24 +45,23 @@
 //! 设计讨论与决策因果链见 `dev-notes/rwlock-20260923-2204.md`。
 
 mod core_;
-mod error_;
 mod reader_;
 mod rwlock_;
-mod state_;
-#[cfg(test)]
-mod tests_;
 mod upgrade_;
-mod wait_;
+mod wait_node_;
 mod writer_;
 
-pub use error_::CoopRwLockError;
+#[cfg(test)]
+#[path = "../cooperative_tests_.rs"]
+mod tests_;
+
+pub use super::error_::CoopRwLockError;
 pub use reader_::{ReadAcquireAsync, ReadAcquireFuture, ReaderGuard};
 pub use rwlock_::{
-    CooperativeAcqSession, CooperativeRwLock, CooperativeRwLockBorrowed,
-    CooperativeRwLockOwned,
+    CooperativeAcqSession, CooperativeRwLock, CooperativeRwLockBorrowed, CooperativeRwLockOwned,
 };
 pub use upgrade_::{
-    UpgradableReadAcquireAsync, UpgradableReadAcquireFuture,
-    UpgradableReaderGuard, Upgrade, UpgradeAcquireAsync, UpgradeAcquireFuture,
+    UpgradableReadAcquireAsync, UpgradableReadAcquireFuture, UpgradableReaderGuard, Upgrade,
+    UpgradeAcquireAsync, UpgradeAcquireFuture,
 };
 pub use writer_::{WriteAcquireAsync, WriteAcquireFuture, WriterGuard};

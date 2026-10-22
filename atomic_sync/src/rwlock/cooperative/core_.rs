@@ -23,25 +23,35 @@
 //! 插队之后该槽位计入 `WRITER_QUEUED`，`WRITER_QUEUED` 自然挡住新读者，
 //! 所以升级既不会死锁，也不会被新读者无限推迟。
 
-use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
-use core::{borrow::BorrowMut, task::Waker};
+use alloc::{
+    alloc::{Allocator, Global},
+    collections::VecDeque,
+    sync::Arc,
+    vec::Vec,
+};
+use core::{alloc::AllocatorClone, borrow::BorrowMut, task::Waker};
 
 use funty::Unsigned;
 
-use atomex::{x_deps::funty, StrictOrderings, TrAtomicData, TrCmpxchOrderings};
+use atomex::{StrictOrderings, TrAtomicData, TrCmpxchOrderings, x_deps::funty};
 
-use super::{
+use crate::rwlock::{
     state_::CoopRwState,
-    wait_::{SpinLock, WaitKind, WaitNode, WaitQueue},
+    wait_::{SpinLock, WaitKind},
 };
 
+use super::wait_node_::WaitNode;
+
+/// 堆分配队列：队首即最先到达的等待者。
+type WaitQueue<A> = VecDeque<Arc<WaitNode<A>, A>, A>;
+
 /// 一次获取动作的当前进展。
-pub(super) enum AcqProgress {
+pub(super) enum AcqProgress<A: Allocator> {
     /// 已经拿到许可。
     Acquired,
     /// 仍在队列里等待；future 需要记住这两个值以便重试与取消。
     Waiting {
-        node_: Arc<WaitNode>,
+        node_: Arc<WaitNode<A>, A>,
         slot_: usize,
     },
 }
@@ -50,14 +60,16 @@ pub(super) enum AcqProgress {
 ///
 /// 它不承载被保护的资源 `T`（资源内联在 `CooperativeRwLock` 外壳里），
 /// 因此与 `T` 的类型和大小都无关，可以稳定地放在 `Arc` 里共享。
-pub(super) struct RwCore<D, B, O = StrictOrderings>
+pub(super) struct RwCore<D, B, O = StrictOrderings, A: Allocator = Global>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
 {
     stat_: CoopRwState<D, B, O>,
-    queue_: SpinLock<QueuePayload>,
+    queue_: SpinLock<QueuePayload<A>>,
+    /// 等待节点（`Arc` 与节点内槽位 `Vec`）使用的分配器。
+    alloc_: A,
 }
 
 /// 队列自旋锁保护的载荷：FIFO 等待队列 + 队列中独占等待者的计数。
@@ -71,24 +83,26 @@ where
 /// 它与队列共用同一把锁，因此只在持有队列锁时读写。`RwCore` 共享在 `Arc` 里，
 /// 所有入口只拿得到 `&self`，把计数器放进锁内载荷是它唯一不需要 `unsafe` 的
 /// 可变访问路径。
-struct QueuePayload {
-    nodes_: WaitQueue,
+struct QueuePayload<A: Allocator> {
+    nodes_: WaitQueue<A>,
     writer_waiters_: usize,
 }
 
-impl<D, B, O> RwCore<D, B, O>
+impl<D, B, O, A> RwCore<D, B, O, A>
 where
     D: TrAtomicData + Unsigned,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     O: TrCmpxchOrderings,
+    A: AllocatorClone,
 {
-    pub(super) const fn new(cell: B) -> Self {
+    pub(super) fn new_in(cell: B, alloc: A) -> Self {
         RwCore {
             stat_: CoopRwState::new(cell),
             queue_: SpinLock::new(QueuePayload {
-                nodes_: VecDeque::new(),
+                nodes_: VecDeque::new_in(alloc.clone()),
                 writer_waiters_: 0,
             }),
+            alloc_: alloc,
         }
     }
 
@@ -157,7 +171,7 @@ where
     ///
     /// 三步（入队、尝试领取、注册 waker）在同一段临界区内完成，这是避免
     /// "丢唤醒"的关键：临界区之外没有任何时刻能让别人替我跑 `pass()`。
-    pub(super) fn acquire(&self, kind: WaitKind, waker: &Waker) -> AcqProgress {
+    pub(super) fn acquire(&self, kind: WaitKind, waker: &Waker) -> AcqProgress<A> {
         let mut q = self.queue_.lock();
         self.prune_front_(&mut q);
         let (node, slot) = self.enqueue_(&mut q, kind);
@@ -192,15 +206,14 @@ where
     /// 返回 `true` 表示拿到许可；否则刷新 waker 并继续等待。
     pub(super) fn poll_acquire(
         &self,
-        node: &Arc<WaitNode>,
+        node: &Arc<WaitNode<A>, A>,
         slot: usize,
         waker: &Waker,
     ) -> bool {
         let mut q = self.queue_.lock();
         self.prune_front_(&mut q);
 
-        let claimed =
-            self.is_head_(&q, node) && self.try_claim_(node.slot_kind(slot));
+        let claimed = self.is_head_(&q, node) && self.try_claim_(node.slot_kind(slot));
         if claimed {
             node.mark_acquired(slot);
             self.note_exclusive_slot_finished_(&mut q, node);
@@ -221,7 +234,7 @@ where
     /// 对写者/升级槽位还多一层意义：取消必须把该槽位从 `writer_waiters_` 里
     /// 扣除并收回 `WRITER_QUEUED`，否则后续读者会被一个已经不存在的等待者
     /// 永久挡在快速路径之外。
-    pub(super) fn cancel_wait(&self, node: &Arc<WaitNode>, slot: usize) {
+    pub(super) fn cancel_wait(&self, node: &Arc<WaitNode<A>, A>, slot: usize) {
         let mut q = self.queue_.lock();
         node.mark_cancelled(slot);
         self.note_exclusive_slot_finished_(&mut q, node);
@@ -230,11 +243,7 @@ where
         Self::wake_wakers_(wakers);
     }
 
-    fn enqueue_(
-        &self,
-        q: &mut QueuePayload,
-        kind: WaitKind,
-    ) -> (Arc<WaitNode>, usize) {
+    fn enqueue_(&self, q: &mut QueuePayload<A>, kind: WaitKind) -> (Arc<WaitNode<A>, A>, usize) {
         // 读类等待者与队尾的读类节点合并；只与队尾合并，保证 FIFO 次序不被破坏。
         if kind.is_readish()
             && let Some(tail) = q.nodes_.back()
@@ -243,8 +252,8 @@ where
             let slot = tail.push_readish_slot(kind);
             return (tail.clone(), slot);
         }
-        let (node, slot) = WaitNode::new(kind);
-        let node = Arc::new(node);
+        let (node, slot) = WaitNode::new(kind, self.alloc_.clone());
+        let node = Arc::new_in(node, self.alloc_.clone());
         match kind {
             // 升级请求插队，理由见本文件头部说明。
             WaitKind::Upgrade => {
@@ -262,7 +271,7 @@ where
     }
 
     /// 独占（`Write` / `Upgrade`）槽位入队：计数加一，并在由 0 变 1 时置位。
-    fn note_exclusive_slot_queued_(&self, q: &mut QueuePayload) {
+    fn note_exclusive_slot_queued_(&self, q: &mut QueuePayload<A>) {
         q.writer_waiters_ += 1;
         if q.writer_waiters_ == 1 {
             self.stat_.mark_writer_queued();
@@ -273,11 +282,7 @@ where
     ///
     /// 读类槽位直接返回。判定用 `is_readish()` 而不是重新取槽位种类，是为了
     /// 避免在已持有队列锁的前提下再去取节点锁。
-    fn note_exclusive_slot_finished_(
-        &self,
-        q: &mut QueuePayload,
-        node: &WaitNode,
-    ) {
+    fn note_exclusive_slot_finished_(&self, q: &mut QueuePayload<A>, node: &WaitNode<A>) {
         if node.is_readish() {
             return;
         }
@@ -288,7 +293,7 @@ where
         }
     }
 
-    fn is_head_(&self, q: &QueuePayload, node: &Arc<WaitNode>) -> bool {
+    fn is_head_(&self, q: &QueuePayload<A>, node: &Arc<WaitNode<A>, A>) -> bool {
         q.nodes_.front().is_some_and(|f| Arc::ptr_eq(f, node))
     }
 
@@ -297,7 +302,7 @@ where
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
     /// 剪掉队首已经"没有任何在等的人"的节点。
-    fn prune_front_(&self, q: &mut QueuePayload) {
+    fn prune_front_(&self, q: &mut QueuePayload<A>) {
         while q.nodes_.front().is_some_and(|f| f.pending_count() == 0) {
             q.nodes_.pop_front();
         }
@@ -315,7 +320,7 @@ where
     ///
     /// 这里**只负责唤醒**，不预先分配任何许可：真正的领取始终由等待者在
     /// `poll` 里自己比较交换完成，因此"被唤醒后立刻取消"不会泄漏许可。
-    fn pass_(&self, q: &mut QueuePayload) -> Vec<Waker> {
+    fn pass_(&self, q: &mut QueuePayload<A>) -> Vec<Waker, A> {
         self.prune_front_(q);
         if q.nodes_.is_empty() {
             self.stat_.clear_waiters_present();
@@ -326,7 +331,7 @@ where
                 q.writer_waiters_ = 0;
                 self.stat_.clear_writer_queued();
             }
-            return Vec::new();
+            return Vec::new_in(self.alloc_.clone());
         }
 
         let snap = self.stat_.snapshot();
@@ -338,13 +343,13 @@ where
             "WRITER_QUEUED 与 writer_waiters_ 不一致"
         );
         if snap.writer_active {
-            return Vec::new();
+            return Vec::new_in(self.alloc_.clone());
         }
 
         let Some(front) = q.nodes_.front() else {
-            return Vec::new();
+            return Vec::new_in(self.alloc_.clone());
         };
-        let mut out = Vec::new();
+        let mut out = Vec::new_in(self.alloc_.clone());
         if front.is_readish() {
             let mut upgrade_taken = snap.upgrade_active;
             front.admit_waiting(&mut out, |kind| match kind {
@@ -357,9 +362,7 @@ where
             });
         } else {
             match front.solo_kind() {
-                WaitKind::Write
-                    if snap.reader_count == D::ZERO && !snap.upgrade_active =>
-                {
+                WaitKind::Write if snap.reader_count == D::ZERO && !snap.upgrade_active => {
                     front.admit_waiting(&mut out, |_| true);
                 }
                 WaitKind::Upgrade if snap.reader_count == D::ONE => {
@@ -395,7 +398,7 @@ where
     /// 本线程在临界区内看到条件成立而放行了自己，却因为"目的就是自己"
     /// 而不唤醒，从此没有任何人再唤醒它 → 永久挂起。
     /// 多一次自我唤醒最多多一次 poll，代价远小于丢失唤醒。
-    fn wake_wakers_(wakers: Vec<Waker>) {
+    fn wake_wakers_(wakers: Vec<Waker, A>) {
         for w in wakers {
             w.wake();
         }
@@ -416,8 +419,12 @@ where
     pub(super) fn release_upgradable_read(&self) {
         // 注意：状态迁移**必须**无条件执行；把它写进 `debug_assert!` 里
         // 会让 release 构建直接跳过迁移（这里曾经真的踩过这个坑）。
-        let _ok = self.stat_.release_upgradable_read();
-        debug_assert!(_ok, "state transition `release_upgradable_read` failed");
+        if !self.stat_.release_upgradable_read() {
+            // 该守卫可能已经被并行的“写者降级为可升级读”转换成了普通读
+            // （`UPGRADE_ACTIVE` 已清除）。此时按普通读归还，避免读者计数泄漏。
+            let fallback = self.stat_.release_reader();
+            debug_assert!(fallback, "可升级读释放失败且无法回退为普通读");
+        }
         self.run_pass_();
     }
 
@@ -441,7 +448,10 @@ where
         // 注意：状态迁移**必须**无条件执行；把它写进 `debug_assert!` 里
         // 会让 release 构建直接跳过迁移（这里曾经真的踩过这个坑）。
         let _ok = self.stat_.downgrade_write_to_upgradable();
-        debug_assert!(_ok, "state transition `downgrade_write_to_upgradable` failed");
+        debug_assert!(
+            _ok,
+            "state transition `downgrade_write_to_upgradable` failed"
+        );
         self.run_pass_();
     }
 
@@ -449,7 +459,10 @@ where
         // 注意：状态迁移**必须**无条件执行；把它写进 `debug_assert!` 里
         // 会让 release 构建直接跳过迁移（这里曾经真的踩过这个坑）。
         let _ok = self.stat_.downgrade_upgradable_to_read();
-        debug_assert!(_ok, "state transition `downgrade_upgradable_to_read` failed");
+        debug_assert!(
+            _ok,
+            "state transition `downgrade_upgradable_to_read` failed"
+        );
         self.run_pass_();
     }
 }
