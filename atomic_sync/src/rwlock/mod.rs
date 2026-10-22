@@ -12,12 +12,8 @@ mod error_;
 mod state_;
 mod wait_;
 
-#[cfg(not(feature = "cooperative-arena"))]
 pub mod cooperative;
-
-#[cfg(feature = "cooperative-arena")]
-#[path = "cooperative_arena/mod.rs"]
-pub mod cooperative;
+pub mod cooperative_arena;
 
 pub mod preemptive;
 

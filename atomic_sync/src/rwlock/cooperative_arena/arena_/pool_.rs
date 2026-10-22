@@ -67,7 +67,7 @@ use super::chunk_::{CHUNK_CAPACITY, Chunk, FREE_END, LIVE_MARK, Slot};
 ///
 /// 一个 chunk 是 1024 个槽位的整块分配；只有当前 chunk 满时才会再申请一块。
 /// 空掉的非当前 chunk 会立即归还分配器，当前 chunk 则保留复用。
-pub(in crate::rwlock::cooperative) struct Arena<T, A: Allocator = Global> {
+pub(in crate::rwlock::cooperative_arena) struct Arena<T, A: Allocator = Global> {
     /// 链表中最早的 chunk。
     head_: Option<NonNull<Chunk<T, A>>>,
     /// 当前用于分配的 chunk（也是链表尾）。
@@ -85,12 +85,12 @@ unsafe impl<T: Send, A: Allocator + Send> Send for Arena<T, A> {}
 
 impl<T, A: Allocator> Arena<T, A> {
     /// 单个 chunk 的布局；用于分配失败时的 `handle_alloc_error` 报告。
-    pub(in crate::rwlock::cooperative) fn chunk_layout() -> Layout {
+    pub(in crate::rwlock::cooperative_arena) fn chunk_layout() -> Layout {
         Layout::new::<Chunk<T, A>>()
     }
 
     /// 建立一个空池；chunk 在第一次分配时惰性申请。
-    pub(in crate::rwlock::cooperative) const fn new(alloc: A) -> Self {
+    pub(in crate::rwlock::cooperative_arena) const fn new(alloc: A) -> Self {
         Arena {
             head_: None,
             tail_: None,
@@ -108,7 +108,7 @@ impl<T, A: Allocator> Arena<T, A> {
     ///
     /// 当前 chunk 已满且分配器无法提供新 chunk 时返回 [`AllocError`]，此时
     /// 池的状态不变，`value` 随函数返回被丢弃。
-    pub(in crate::rwlock::cooperative) fn alloc(
+    pub(in crate::rwlock::cooperative_arena) fn alloc(
         &mut self,
         value: T,
     ) -> Result<NonNull<T>, AllocError> {
@@ -153,7 +153,7 @@ impl<T, A: Allocator> Arena<T, A> {
     /// 若槽位不在存活状态，会 panic；这通常意味着句柄属于另一个池、已经被
     /// 释放，或者它所在的空 chunk 已经被归还给分配器。
     #[cfg(test)]
-    pub(in crate::rwlock::cooperative) unsafe fn get(&self, ptr: NonNull<T>) -> &T {
+    pub(in crate::rwlock::cooperative_arena) unsafe fn get(&self, ptr: NonNull<T>) -> &T {
         // SAFETY: 调用方保证 `ptr` 指向本池中一个仍然存活的槽位。
         unsafe { self.assert_live_(ptr) };
         // SAFETY: 上面已确认槽位存活；调用方保证指针属于本池且未回收。
@@ -171,7 +171,7 @@ impl<T, A: Allocator> Arena<T, A> {
     ///
     /// 若槽位不在存活状态，会 panic。
     #[cfg(test)]
-    pub(in crate::rwlock::cooperative) unsafe fn get_mut(&mut self, mut ptr: NonNull<T>) -> &mut T {
+    pub(in crate::rwlock::cooperative_arena) unsafe fn get_mut(&mut self, mut ptr: NonNull<T>) -> &mut T {
         // SAFETY: 同 `get`。
         unsafe { self.assert_live_(ptr) };
         // SAFETY: 上面已确认槽位存活；`&mut self` 保证本池没有其它借用。
@@ -194,7 +194,7 @@ impl<T, A: Allocator> Arena<T, A> {
     ///
     /// 若槽位不在存活状态，会 panic（重复释放是调用方的契约错误）。
     #[must_use = "free 返回被移出池的值，请显式丢弃或复用；不要把它留在池里"]
-    pub(in crate::rwlock::cooperative) unsafe fn free(&mut self, ptr: NonNull<T>) -> T {
+    pub(in crate::rwlock::cooperative_arena) unsafe fn free(&mut self, ptr: NonNull<T>) -> T {
         let slot = ptr.cast::<Slot<T>>();
         // SAFETY: 调用方保证 `ptr` 指向本池中一个仍然存活的槽位；它的
         // `self_idx_` 与槽位真实下标一致，因此可以反推 chunk。
@@ -229,7 +229,7 @@ impl<T, A: Allocator> Arena<T, A> {
 
     /// 当前承载着已初始化值的槽位总数。
     #[cfg(test)]
-    pub(in crate::rwlock::cooperative) fn len(&self) -> usize {
+    pub(in crate::rwlock::cooperative_arena) fn len(&self) -> usize {
         let mut total = 0;
         let mut cur = self.head_;
         while let Some(chunk) = cur {
@@ -243,13 +243,13 @@ impl<T, A: Allocator> Arena<T, A> {
 
     /// 池中是否没有任何存活对象（可能仍保留一个空的当前 chunk）。
     #[cfg(test)]
-    pub(in crate::rwlock::cooperative) fn is_empty(&self) -> bool {
+    pub(in crate::rwlock::cooperative_arena) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// 当前链表中的 chunk 数量（包含保留的空当前 chunk）。
     #[cfg(test)]
-    pub(in crate::rwlock::cooperative) fn chunk_count(&self) -> usize {
+    pub(in crate::rwlock::cooperative_arena) fn chunk_count(&self) -> usize {
         let mut count = 0;
         let mut cur = self.head_;
         while let Some(chunk) = cur {
