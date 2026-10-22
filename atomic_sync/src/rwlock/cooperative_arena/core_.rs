@@ -1227,6 +1227,32 @@ mod tests_ {
         assert!(core.pool_is_empty(), "取消节点应随整组批量回收");
     }
 
+    /// 验证可升级读释放失败时能回退为普通读，不泄漏读者计数。
+    ///
+    /// Verifies releasing an upgradable read falls back to a plain reader when
+    /// the upgrade flag was already cleared by a parallel downgrade.
+    ///
+    /// - 手段：快速获取可升级读并升级为写者；把写者降级为可升级读、再降级为
+    ///   普通读；释放额外读后，再释放最初的可升级读守卫。
+    /// - 判断：`UPGRADE_ACTIVE` 已被降级路径清除，最初守卫释放时必须按普通读
+    ///   回退，最终 `reader_count` 归零且队列为空。
+    #[test]
+    fn release_upgradable_read_falls_back_to_reader() {
+        let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
+        assert!(core.try_upgradable_read_fast(), "可升级读快速路径应成功");
+        assert!(core.try_upgrade_now(), "独占时应能立即升级");
+
+        core.downgrade_write_to_upgradable();
+        core.downgrade_upgradable_to_read(false);
+        core.release_reader(false);
+        assert_eq!(core.reader_count(), 1);
+
+        // `UPGRADE_ACTIVE` 已被额外降级清除，这里走普通读回退。
+        core.release_upgradable_read(false);
+        assert_eq!(core.reader_count(), 0, "可升级读释放不应泄漏计数");
+        assert!(!core.waiters_present());
+    }
+
     /// 验证可升级读先于普通读释放时不会误留升级占位。
     ///
     /// Verifies releasing the upgradable reader before a plain reader does not

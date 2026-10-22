@@ -285,11 +285,11 @@ struct WriteNode {
 
 验证结果：
 
-- `cargo test -p atomic_sync`：85 个单测 + 7 个 cooperative 集成测试 +
+- `cargo test -p atomic_sync`：86 个单测 + 7 个 cooperative 集成测试 +
   2 个 cooperative_arena 集成测试 + 8 个 preemptive 测试 + 4 个文档测试
   全部通过；
 - `cooperative_arena` 库测试连续 25 轮压力运行通过；
-- `cargo miri test`（`-Zmiri-strict-provenance`）：6 个 core 单测与 8 个
+- `cargo miri test`（`-Zmiri-strict-provenance`）：7 个 core 单测与 8 个
   Arena 池单测全部通过；
 - `cargo clippy -p atomic_sync --all-targets` 无告警（共享测试文件对
   `clippy::duplicate_mod` 显式豁免）；
