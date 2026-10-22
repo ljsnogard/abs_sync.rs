@@ -163,6 +163,48 @@ async fn upgrade_should_jump_ahead_of_queued_writer() {
     assert!(writer_entered.load(Ordering::SeqCst));
 }
 
+/// 测试多个可升级读请求共用同一个读节点时，前一个释放后后一个能继续推进。
+///
+/// Tests that queued upgradable-read requests sharing one read node make
+/// progress after the previous holder releases.
+///
+/// - 手段：主任务先持有可升级读，spawn 两个依次请求可升级读的任务并让它们
+///   入队；随后释放主任务的可升级读。
+/// - 判断：两个任务都必须在超时内完成。若实现把已 `Acquired` 的旧可升级
+///   读槽位误判为"仍占用升级名额"，第二个请求会被永久挡住。
+#[compio::test]
+async fn queued_upgradable_readers_should_progress_sequentially() {
+    let lock = Arc::new(TestLock::new_owned(0));
+    let mut sess_hold = lock.acquire_session();
+    let hold = sess_hold.try_upgradable_read().unwrap();
+
+    let l1 = Arc::clone(&lock);
+    let first = compio::runtime::spawn(async move {
+        let mut s = l1.acquire_session();
+        let g = s.upgradable_read_async().await.unwrap();
+        drop(g);
+    });
+
+    let l2 = Arc::clone(&lock);
+    let second = compio::runtime::spawn(async move {
+        let mut s = l2.acquire_session();
+        let g = s.upgradable_read_async().await.unwrap();
+        drop(g);
+    });
+    let_tasks_settle().await;
+
+    drop(hold);
+
+    let first = with_timeout(first, compio::time::sleep(Duration::from_millis(500))).await;
+    assert!(matches!(first, Some(Ok(()))), "第一个可升级读应完成");
+
+    let second = with_timeout(second, compio::time::sleep(Duration::from_millis(500))).await;
+    assert!(
+        matches!(second, Some(Ok(()))),
+        "前一个可升级读释放后，第二个应能继续"
+    );
+}
+
 /// 测试升级得到的写者释放后会回退成原本的可升级读。
 /// - 手段：升级写入数据、释放写守卫，然后再次升级、最后取回可升级读守卫。
 /// - 判断：首次释放后读者计数仍为 1（槽位仍被会话持有）且能再次升级；

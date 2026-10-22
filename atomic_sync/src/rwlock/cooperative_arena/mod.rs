@@ -15,22 +15,26 @@
 //! RwCoreArena<D, B, O>
 //! ├── stat_  : CoopRwState<D, B, O>          // 状态字
 //! └── queue_ : SpinLock<QueuePayload>
-//!     ├── head_ / tail_ : NonNull<ArenaWaitNode>
+//!     ├── head_ / tail_ : NonNull<ArenaItem>
 //!     ├── writer_waiters_
-//!     └── arena_ : Arena<ArenaWaitNode>      // 节点池
+//!     └── arena_ : Arena<ArenaItem>          // 节点 + 槽位共用池
 //! ```
 //!
 //! # 并发模型
 //!
 //! 快速路径、放行语义、取消回收与升级插队规则与堆分配版逐条一致；区别只在
-//! 等待节点的生命周期：
+//! 等待节点/槽位的生命周期：
 //!
-//! - 入队时从 Arena 取一个节点，插入链表；
-//! - 节点从队首回收后立即归还 Arena 槽位；非当前 chunk 清空时整块归还分配器；
-//! - 节点地址在存活期间稳定，因此链表直接保存裸指针，不需要 `Arc` 或索引。
+//! - 入队时为节点和槽位各取一个 Arena 元素，节点插入链表，槽位插入节点的
+//!   侵入式槽位链；
+//! - 节点从队首回收后，槽位与节点依次归还 Arena；非当前 chunk 清空时整块
+//!   归还分配器；
+//! - 元素地址在存活期间稳定，因此链表直接保存裸指针，不需要 `Arc`、`Vec`
+//!   或索引；
+//! - 唤醒批是栈上固定数组，超过容量时解锁唤醒后分批继续。
 //!
-//! 所有队列操作仍然在 `queue_` 自旋锁内完成；锁内只收集 waker，不调用
-//! `Waker::wake`。
+//! 因此等待路径除 chunk 分配外不再发生堆分配。所有队列操作仍然在 `queue_`
+//! 自旋锁内完成；锁内只收集 waker，不调用 `Waker::wake`。
 
 mod arena_;
 mod core_;

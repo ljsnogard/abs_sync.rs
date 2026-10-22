@@ -18,13 +18,15 @@ use abs_sync::{async_rwlock::*, sync_guard::TrAcqRefGuard, x_deps::abs_cancel};
 
 use crate::rwlock::TrShareMut;
 
+use super::wait_node_::WaitNode;
+
 use super::{
     core_::AcqProgress, reader_::ReaderGuard, rwlock_::CooperativeAcqSession,
     writer_::WriterGuard,
 };
 use crate::rwlock::{
     error_::CoopRwLockError,
-    wait_::{WaitKind, WaitNode},
+    wait_::WaitKind,
 };
 
 /// 可升级读守卫。

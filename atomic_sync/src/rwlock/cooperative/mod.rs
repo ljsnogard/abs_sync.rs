@@ -43,6 +43,7 @@ mod core_;
 mod reader_;
 mod rwlock_;
 mod upgrade_;
+mod wait_node_;
 mod writer_;
 
 #[cfg(test)]

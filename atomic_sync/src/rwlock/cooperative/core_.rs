@@ -32,8 +32,10 @@ use atomex::{x_deps::funty, StrictOrderings, TrAtomicData, TrCmpxchOrderings};
 
 use crate::rwlock::{
     state_::CoopRwState,
-    wait_::{SpinLock, WaitKind, WaitNode},
+    wait_::{SpinLock, WaitKind},
 };
+
+use super::wait_node_::WaitNode;
 
 /// 堆分配队列：队首即最先到达的等待者。
 type WaitQueue = VecDeque<Arc<WaitNode>>;
