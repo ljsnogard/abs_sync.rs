@@ -1,14 +1,16 @@
 //! Arena 版协作式读写锁内核：状态字 + 侵入式等待链 + Arena 节点/槽位。
 //!
-//! 并发语义与堆分配版 `core_` 逐条一致，差别只在等待队列的承载方式：
+//! 并发语义与堆分配版 `core_` 一致，但把队列锁缩小到只保护拓扑：
 //!
-//! - 等待节点与等待槽位都是 [`ArenaItem`]，由同一个固定槽位池分配；
-//! - 节点之间用 `prev_` / `next_` 双向链接，节点内的多个读槽位用侵入式链；
-//! - 除 chunk 分配外，等待路径不再发生任何运行时堆分配：
-//!   - 节点/槽位来自 [`Arena`]；
-//!   - 唤醒批 [`WakerBatch`] 是栈上固定数组，超过容量时解锁唤醒后分批继续；
-//! - 所有队列操作仍然在 `queue_` 自旋锁内完成；锁内只收集 waker，不调用
-//!   `Waker::wake`。
+//! - 队列锁只负责入队、摘链、队首选择、`sealed_` / `waking_` 标记与 Arena
+//!   回收；**不负责唤醒**；
+//! - 被选中的读节点会 `sealed_`，新读者不再合并进来；`waking_` 保证同一节点
+//!   只有一个唤醒者，并防止它在唤醒期间被回收；
+//! - 唤醒者在锁外逐个槽位取 waker 并唤醒，不需要收集批，也不需要在固定容量
+//!   批次之间反复取队列锁；
+//! - 已被放行的读者可以直接 CAS 领取，不再检查队首、也不再取队列锁；只有
+//!   最后一个 pending 槽位完成时才取一次队列锁推进队列；
+//! - 等待节点与槽位都由 [`Arena`] 分配，等待路径除 chunk 外不分配堆内存。
 
 use alloc::alloc::{Global, handle_alloc_error};
 use core::{borrow::BorrowMut, ptr::NonNull, task::Waker};
@@ -24,13 +26,10 @@ use crate::rwlock::{
 
 use super::{
     arena_::Arena,
-    wait_arena_::{ArenaItem, ArenaWaitNode, ArenaWaiterSlot, WakerBatch},
+    wait_arena_::{ArenaItem, ArenaWaitNode, ArenaWaiterSlot, SlotState},
 };
 
 /// 等待中 future 持有的句柄：节点元素 + 槽位元素。
-///
-/// 两者都来自本队列的 Arena，在槽位待决期间一定存活；句柄本身不提供访问，
-/// 只有 [`RwCoreArena`] 在持有队列锁时才会解引用它。
 #[derive(Clone, Copy)]
 pub(super) struct PendingWait {
     node_: NonNull<ArenaItem>,
@@ -38,7 +37,7 @@ pub(super) struct PendingWait {
 }
 
 // SAFETY: 句柄只保存两个 Arena 元素的地址。元素由 Arena 持有，地址在存活期间
-// 稳定；所有解引用都发生在队列自旋锁内，移动句柄本身不会产生别名访问。
+// 稳定；所有解引用都发生在队列/节点锁内，移动句柄本身不会产生别名访问。
 unsafe impl Send for PendingWait {}
 // SAFETY: 同上；共享 `&PendingWait` 只读取地址，不提供可变访问。
 unsafe impl Sync for PendingWait {}
@@ -59,6 +58,8 @@ struct QueuePayload {
     tail_: Option<NonNull<ArenaItem>>,
     /// 队列中仍处于待决状态的 `Write` / `Upgrade` 槽位数。
     writer_waiters_: usize,
+    /// 有线程发现队首正在被别的唤醒者处理，需要唤醒者在清标记后重跑。
+    retry_: bool,
     /// 等待节点与等待槽位共用的池。
     arena_: Arena<ArenaItem>,
 }
@@ -92,6 +93,7 @@ where
                 head_: Option::None,
                 tail_: Option::None,
                 writer_waiters_: 0,
+                retry_: false,
                 arena_: Arena::new(Global),
             }),
         }
@@ -151,12 +153,11 @@ where
     }
 
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-    // 获取：入队 / 领取 / 注册 waker 在同一段队列锁临界区内完成
+    // 获取
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
     pub(super) fn acquire(&self, kind: WaitKind, waker: &Waker) -> AcqProgress {
-        let mut out = WakerBatch::new();
-        let (claimed, pending, full) = {
+        let (claimed, pending) = {
             let mut q = self.queue_.lock();
             self.prune_front_(&mut q);
             let pending = self.enqueue_(&mut q, kind);
@@ -169,18 +170,22 @@ where
                 let node = unsafe { pending.node_.as_ref() }.as_node();
                 let claimed = self.is_head_(&q, &pending) && self.try_claim_(kind);
                 if claimed {
-                    node.mark_acquired(pending.slot_);
+                    let finish = node.mark_acquired(pending.slot_);
+                    if finish {
+                        // 队列锁已持有，直接完成收尾，稍后统一 prune。
+                        node.clear_finalizing_();
+                    }
                     self.note_exclusive_slot_finished_(&mut q, &pending);
                 } else {
                     node.set_waker(pending.slot_, waker);
                 }
                 claimed
             };
-
-            let full = self.pass_(&mut q, &mut out);
-            (claimed, pending, full)
+            (claimed, pending)
         };
-        self.finish_pass_(out, full);
+
+        // 入队者已经注册 waker；锁外推进放行流程。
+        self.run_pass_();
 
         if claimed {
             AcqProgress::Acquired
@@ -190,57 +195,100 @@ where
     }
 
     /// 已被唤醒的等待者重试领取。
+    ///
+    /// 如果槽位已经是 `Admitted`，这里直接 CAS 领取，**不获取队列锁**；
+    /// 只有独占槽位完成计数，或该槽位是节点最后一个 pending 槽位时，才取
+    /// 一次队列锁推进队列。
     pub(super) fn poll_acquire(&self, pending: &PendingWait, waker: &Waker) -> bool {
-        let mut out = WakerBatch::new();
-        let (claimed, full) = {
-            let mut q = self.queue_.lock();
-            self.prune_front_(&mut q);
+        // SAFETY: 句柄对应的槽位仍处于待决状态，元素一定还没有被回收。
+        let node = unsafe { pending.node_.as_ref() }.as_node();
+        let state = node.slot_state_(pending.slot_);
 
-            let claimed = {
-                // SAFETY: 句柄对应的槽位仍处于待决状态，元素一定还没有被回收。
-                let node = unsafe { pending.node_.as_ref() }.as_node();
-                let claimed =
-                    self.is_head_(&q, pending) && self.try_claim_(node.slot_kind(pending.slot_));
-                if claimed {
-                    node.mark_acquired(pending.slot_);
-                    self.note_exclusive_slot_finished_(&mut q, pending);
-                } else {
-                    node.set_waker(pending.slot_, waker);
-                }
-                claimed
-            };
+        if state == SlotState::Admitted {
+            let kind = node.slot_kind(pending.slot_);
+            if self.try_claim_(kind) {
+                let finish = node.mark_acquired(pending.slot_);
+                self.finish_claimed_(pending, kind, finish);
+                return true;
+            }
+        } else if state != SlotState::Waiting {
+            debug_assert!(false, "poll_acquire: 在 Acquired/Cancelled 状态上再次 poll");
+            return false;
+        }
 
-            let full = self.pass_(&mut q, &mut out);
-            (claimed, full)
-        };
-        self.finish_pass_(out, full);
-        claimed
+        node.set_waker(pending.slot_, waker);
+        self.run_pass_();
+        false
     }
 
     /// 等待者被取消（future 被丢弃）。
     pub(super) fn cancel_wait(&self, pending: &PendingWait) {
-        let mut out = WakerBatch::new();
-        let full = {
+        // SAFETY: 句柄对应的槽位仍处于待决状态，元素一定还没有被回收。
+        let node = unsafe { pending.node_.as_ref() }.as_node();
+        let kind = node.slot_kind(pending.slot_);
+        let finish = node.mark_cancelled(pending.slot_);
+
+        if matches!(kind, WaitKind::Write | WaitKind::Upgrade) {
             let mut q = self.queue_.lock();
-            {
-                // SAFETY: 句柄对应的槽位仍处于待决状态，元素一定还没有被回收。
-                let node = unsafe { pending.node_.as_ref() }.as_node();
-                node.mark_cancelled(pending.slot_);
-                self.note_exclusive_slot_finished_(&mut q, pending);
+            self.note_exclusive_slot_finished_(&mut q, pending);
+            if finish {
+                // SAFETY: finalizing_ 保证节点在清除前不会被回收。
+                unsafe { pending.node_.as_ref() }
+                    .as_node()
+                    .clear_finalizing_();
             }
-            self.pass_(&mut q, &mut out)
-        };
-        self.finish_pass_(out, full);
+            drop(q);
+            self.run_pass_();
+        } else if finish {
+            self.finalize_node_(pending.node_);
+        } else {
+            self.run_pass_();
+        }
+    }
+
+    /// 槽位已经领取成功后的收尾。
+    fn finish_claimed_(&self, pending: &PendingWait, kind: WaitKind, finish: bool) {
+        if matches!(kind, WaitKind::Write | WaitKind::Upgrade) {
+            let mut q = self.queue_.lock();
+            self.note_exclusive_slot_finished_(&mut q, pending);
+            if finish {
+                // SAFETY: finalizing_ 保证节点在清除前不会被回收。
+                unsafe { pending.node_.as_ref() }
+                    .as_node()
+                    .clear_finalizing_();
+            }
+            drop(q);
+            self.run_pass_();
+            return;
+        }
+        if finish {
+            self.finalize_node_(pending.node_);
+        }
+    }
+
+    /// 节点最后一个 pending 槽位完成后的收尾。
+    ///
+    /// `finalizing_` 在槽位完成时置位，阻止其他线程提前回收；这里在队列锁内
+    /// 清除并 prune。节点不是队首时只清除标记，等它到达队首再回收。
+    fn finalize_node_(&self, node_item: NonNull<ArenaItem>) {
+        let mut q = self.queue_.lock();
+        // SAFETY: finalizing_ 在本次调用前保证节点不会被回收。
+        unsafe { &mut *node_item.as_ptr() }
+            .as_node_mut()
+            .clear_finalizing_();
+        self.prune_front_(&mut q);
+        drop(q);
+        self.run_pass_();
     }
 
     fn enqueue_(&self, q: &mut QueuePayload, kind: WaitKind) -> PendingWait {
-        // 读类等待者与队尾的读类节点合并；只与队尾合并，保证 FIFO 次序不被破坏。
+        // 读类等待者只与"还没被封口"的读类尾节点合并。
         if kind.is_readish()
             && let Some(tail) = q.tail_
         {
             // SAFETY: `tail_` 指向本队列中仍然存活的节点。
             let tail_node = unsafe { tail.as_ref() }.as_node();
-            if tail_node.is_readish() {
+            if tail_node.is_readish() && !tail_node.sealed_ {
                 let slot = self.alloc_slot_(q, kind);
                 tail_node.push_slot(slot);
                 return PendingWait {
@@ -348,27 +396,32 @@ where
     }
 
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
-    // 放行流程
+    // 队列推进 / 锁外唤醒
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
     /// 剪掉队首已经"没有任何在等的人"的节点，并把节点/槽位还给 Arena。
+    ///
+    /// `waking_` 的节点正在被唤醒者遍历，即使 pending 为 0 也不能回收。
     fn prune_front_(&self, q: &mut QueuePayload) {
         while let Some(front) = q.head_ {
             // SAFETY: `front` 是链表中仍然存活的节点。
-            let (pending_count, next) = unsafe {
+            let (pending_count, next, waking, finalizing) = unsafe {
                 let node = front.as_ref().as_node();
-                (node.pending_count(), node.next_)
+                (
+                    node.pending_count(),
+                    node.next_,
+                    node.waking_,
+                    node.is_finalizing_(),
+                )
             };
-            if pending_count != 0 {
+            if waking || finalizing || pending_count != 0 {
                 break;
             }
 
             q.head_ = next;
             match next {
                 // SAFETY: `next` 是链表中仍然存活的节点。
-                Some(next) => unsafe {
-                    next.as_ptr().as_mut().unwrap().as_node_mut().prev_ = Option::None
-                },
+                Some(next) => unsafe { &mut *next.as_ptr() }.as_node_mut().prev_ = Option::None,
                 None => q.tail_ = Option::None,
             }
 
@@ -385,11 +438,8 @@ where
         }
     }
 
-    /// 放行一批等待者，把 waker 收集到栈上批次。
-    ///
-    /// 返回 `true` 表示批次已满，调用方应在锁外唤醒后重新加锁继续。
-    fn pass_(&self, q: &mut QueuePayload, out: &mut WakerBatch) -> bool {
-        self.prune_front_(q);
+    /// 在队列锁内选出可以放行的队首节点，并设置 `sealed_` / `waking_`。
+    fn select_head_(&self, q: &mut QueuePayload) -> Option<NonNull<ArenaItem>> {
         if q.head_.is_none() {
             self.stat_.clear_waiters_present();
             if q.writer_waiters_ != 0 {
@@ -397,7 +447,7 @@ where
                 q.writer_waiters_ = 0;
                 self.stat_.clear_writer_queued();
             }
-            return false;
+            return Option::None;
         }
 
         let snap = self.stat_.snapshot();
@@ -407,57 +457,108 @@ where
             "WRITER_QUEUED 与 writer_waiters_ 不一致"
         );
         if snap.writer_active {
-            return false;
+            return Option::None;
         }
 
-        let Some(front) = q.head_ else {
-            return false;
+        let front = q.head_?;
+        // SAFETY: `front` 是链表中仍然存活的节点；队列锁保证这里独占修改标记。
+        let node = unsafe { &mut *front.as_ptr() }.as_node_mut();
+        if node.waking_ {
+            // 让当前唤醒者在清除 waking_ 后重跑一次，避免并发设置 waker 的
+            // 线程看到 waking_ 就退出、而唤醒者已经扫过该槽位的丢唤醒窗口。
+            q.retry_ = true;
+            return Option::None;
+        }
+        if node.is_finalizing_() {
+            return Option::None;
+        }
+
+        if node.is_readish() {
+            // 封口：此后到达的读类等待者不会合并进正在放行的节点。
+            node.sealed_ = true;
+            node.waking_ = true;
+            return Option::Some(front);
+        }
+
+        let admitted = match node.solo_kind() {
+            WaitKind::Write if snap.reader_count == D::ZERO && !snap.upgrade_active => true,
+            WaitKind::Upgrade if snap.reader_count == D::ONE => true,
+            _ => false,
         };
-        // SAFETY: `front` 是链表中仍然存活的节点，且 `prune_front_` 后仍有待决槽位。
-        let front = unsafe { front.as_ref() }.as_node();
-        if front.is_readish() {
-            front.admit_readish(out, snap.upgrade_active)
+        if admitted {
+            node.waking_ = true;
+            Option::Some(front)
         } else {
-            match front.solo_kind() {
-                WaitKind::Write if snap.reader_count == D::ZERO && !snap.upgrade_active => {
-                    front.admit_exclusive(out)
+            Option::None
+        }
+    }
+
+    /// 锁外唤醒一个被选中的节点；返回是否真的放行了槽位。
+    ///
+    /// 期间 `waking_` 阻止节点被 `prune_front_` 回收；槽位状态由节点锁保护，
+    /// 每次 `wake` 都在释放节点锁之后执行。
+    fn wake_node_(&self, node_item: NonNull<ArenaItem>) -> bool {
+        // SAFETY: `node_item` 是 select_head_ 选中的存活节点。
+        let node = unsafe { node_item.as_ref() }.as_node();
+
+        let woke = if node.is_readish() {
+            let upgrade_active = self.stat_.snapshot().upgrade_active;
+            let mut upgrade_taken = upgrade_active || node.has_admitted_upgradable_();
+            let mut cur = node.slot_head_();
+            let mut woke = false;
+            while let Some(slot) = cur {
+                // 槽位链只追加、不摘除；节点由 waking_ 保持存活。
+                let next = node.slot_next_(slot);
+                if let Option::Some(waker) =
+                    node.try_admit_readish_slot_(slot, &mut upgrade_taken, upgrade_active)
+                {
+                    waker.wake();
+                    woke = true;
                 }
-                WaitKind::Upgrade if snap.reader_count == D::ONE => front.admit_exclusive(out),
-                _ => false,
+                cur = next;
             }
-        }
-    }
-
-    /// 锁外唤醒这一批；若批次满，继续循环放行剩余等待者。
-    fn finish_pass_(&self, out: WakerBatch, full: bool) {
-        out.wake_all();
-        if full {
-            self.drain_pass_();
-        }
-    }
-
-    /// 反复执行 `pass` + 锁外唤醒，直到当前可放行的等待者全部处理完。
-    fn drain_pass_(&self) {
-        loop {
-            let mut out = WakerBatch::new();
-            let full = {
-                let mut q = self.queue_.lock();
-                let full = self.pass_(&mut q, &mut out);
-                drop(q);
-                full
-            };
-            out.wake_all();
-            if !full {
-                break;
+            woke
+        } else {
+            match node.slot_head_() {
+                Option::Some(slot) => match node.try_admit_exclusive_slot_(slot) {
+                    Option::Some(waker) => {
+                        waker.wake();
+                        true
+                    }
+                    Option::None => false,
+                },
+                Option::None => false,
             }
-        }
+        };
+
+        // 清除 waking_ 后才能回收节点；下一轮 run_pass_ 会负责 prune。
+        let mut q = self.queue_.lock();
+        // SAFETY: waking_ 在本次唤醒期间阻止了节点回收；队列锁保证独占标记。
+        unsafe { &mut *node_item.as_ptr() }.as_node_mut().waking_ = false;
+        let retry = q.retry_;
+        q.retry_ = false;
+        drop(q);
+        woke || retry
     }
 
+    /// 推进放行流程。队列锁只用于选择/回收节点，唤醒全部在锁外完成。
     fn run_pass_(&self) {
         if !self.stat_.waiters_present() {
             return;
         }
-        self.drain_pass_();
+        loop {
+            let selected = {
+                let mut q = self.queue_.lock();
+                self.prune_front_(&mut q);
+                self.select_head_(&mut q)
+            };
+            let Option::Some(node) = selected else {
+                break;
+            };
+            if !self.wake_node_(node) {
+                break;
+            }
+        }
     }
 
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
@@ -513,18 +614,9 @@ mod tests_ {
 
     use core::{sync::atomic::AtomicUsize, task::Waker};
 
-    use super::super::wait_arena_::WAKER_BATCH;
     use super::{AcqProgress, RwCoreArena, WaitKind};
 
     /// 验证写者持有期间读者的入队、放行与领取流程。
-    ///
-    /// Verifies enqueue, admission and claim of a reader while a writer holds
-    /// the lock, exercising the intrusive queue end to end.
-    ///
-    /// - 手段：先取得写者快速路径，再让一次读获取进入 Arena 队列；释放写者后
-    ///   用同一个 `PendingWait` 重试领取，最后释放读者。
-    /// - 判断：读者第一次返回 `Waiting`，释放写者后重试返回 `true`；领取完成
-    ///   后队列为空，读者计数也能正常归还。
     #[test]
     fn queued_reader_can_be_admitted_and_claimed() {
         let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
@@ -543,14 +635,6 @@ mod tests_ {
     }
 
     /// 验证取消写者等待会收回 `WRITER_QUEUED` 并回收元素。
-    ///
-    /// Verifies cancelling a queued writer clears `WRITER_QUEUED` and reclaims
-    /// the Arena elements.
-    ///
-    /// - 手段：写者持有时让第二个写请求入队，然后直接取消它；释放原写者后再
-    ///   尝试读快速路径。
-    /// - 判断：取消后 `writer_queued` 为假、队列为空；原写者释放后读者快速
-    ///   路径必须成功。
     #[test]
     fn cancelled_writer_releases_barrier_and_elements() {
         let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
@@ -571,21 +655,14 @@ mod tests_ {
         core.release_reader();
     }
 
-    /// 验证读者数量超过一个唤醒批时仍能分批放行和领取。
-    ///
-    /// Verifies that more readers than one waker batch are admitted and
-    /// claimed correctly across multiple locked passes.
-    ///
-    /// - 手段：写者持有时排队 `WAKER_BATCH + 5` 个读者；释放写者触发多批
-    ///   锁外唤醒；随后逐个 `poll_acquire` 领取。
-    /// - 判断：每个读者都能领取成功，队列最终为空，读者计数全部归还。
+    /// 验证一次放行大批读者时所有槽位都能被唤醒和领取。
     #[test]
-    fn reader_batch_larger_than_waker_batch_is_drained() {
+    fn many_queued_readers_are_all_admitted_and_claimed() {
         let core = RwCoreArena::<usize, AtomicUsize>::new(AtomicUsize::new(0));
         assert!(core.try_write_fast(), "写者快速路径应成功");
 
         let waker = Waker::noop();
-        let total = WAKER_BATCH + 5;
+        let total = 70;
         let mut pending = Vec::with_capacity(total);
         for _ in 0..total {
             let AcqProgress::Waiting(p) = core.acquire(WaitKind::Read, waker) else {
@@ -593,12 +670,11 @@ mod tests_ {
             };
             pending.push(p);
         }
-        assert_eq!(pending.len(), total);
         assert!(core.waiters_present(), "读者应已进入队列");
 
         core.release_writer();
         for p in &pending {
-            assert!(core.poll_acquire(p, waker), "分批放行后读者应能领取");
+            assert!(core.poll_acquire(p, waker), "读者应能领取");
         }
         for _ in 0..total {
             core.release_reader();
