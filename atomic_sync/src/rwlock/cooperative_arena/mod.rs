@@ -36,6 +36,9 @@
 //!   可升级读 → 降级为普通读”的整个过程中都靠它连续跟踪持锁者；
 //! - 主队列、读者链发布、写者节点与唤醒遍历由队列锁保护；读者节点的状态与
 //!   waker 用原子状态机维护，领取、取消、waker 注册都**不取队列锁**；
+//! - 原子操作统一用 `atomex::AtomicFlags` / `AtomexPtr` 的
+//!   `try_spin_compare_exchange_weak`，不再手写 CAS 循环；读者状态是
+//!   `AtomicFlags<u8>`，写者槽位也是 `AtomicFlags<u8>` 配 `SLOT_*` 常量；
 //! - `RootRead` 只保存最后加入的读者节点原子尾指针；读者链通过每个节点的
 //!   `prev_` 组成 LIFO 单链，新增读者就是一次 CAS 压栈；
 //! - 放行时在锁内用 CAS 把一批 `Waiting` 读者标成 `Admitted`、累加组计数并

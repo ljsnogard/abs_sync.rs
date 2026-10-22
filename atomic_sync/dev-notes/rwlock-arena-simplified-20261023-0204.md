@@ -215,6 +215,9 @@ Registering --(注册完成)--> Waiting --(唤醒者 CAS)--> Taking --(取走 wa
      +----------------------------(领取失败/重新挂起)-----------------------------+
 ```
 
+- 所有状态迁移都用 `atomex::AtomicFlags<u8>::try_spin_compare_exchange_weak`
+  实现，不再手写 `compare_exchange` 循环；写者槽位同样改成
+  `AtomicFlags<u8>` + `SLOT_*` 常量。
 - `register_waker_`：只从 `Registering` / `Waiting` 进入；写 waker 后 CAS 到
   `Waiting`。如果期间节点已被放行成 `Admitted`，返回 `false`，调用方转入
   领取而不是把它降回 `Waiting`（避免丢失已累加的计数）。
@@ -227,12 +230,17 @@ Registering --(注册完成)--> Waiting --(唤醒者 CAS)--> Taking --(取走 wa
 
 ### 8.2 读者链 LIFO
 
-`RootRead` 只保存 `tail_: AtomicPtr<WaitNode>`；新读者：
+`RootRead` 只保存 `tail_: AtomexPtr<WaitNode>`；新读者：
 
 ```text
-new.prev = tail.load()
-CAS(tail, old, new)
+tail_.try_spin_compare_exchange_weak(
+    |_| true,
+    |current| { new.prev = current; new }
+)
 ```
+
+失败重试时 `desire` 闭包会把 `new.prev` 更新到新的 tail，因此 CAS 重试不会
+丢链。
 
 读者链从 `tail` 沿 `prev` 反向遍历。发布在队列锁内完成（与唤醒遍历互斥），
 所以遍历期间链稳定；但“压栈”本身是一次 CAS。
@@ -253,3 +261,12 @@ CAS(tail, old, new)
 - `cargo clippy -p atomic_sync --all-targets` 无告警；
 - `cooperative_arena` 库测试连续 20 轮压力通过；
 - Miri（`-Zmiri-strict-provenance`）：8 个 core 单测通过。
+
+
+### 8.5 weak CAS 的伪失败
+
+`try_once_compare_exchange_weak` 允许伪失败。`try_admit_` 早期用一次
+`try_once` 从 `Waiting` 抢 `Taking`，在 Miri 上真的遇到伪失败，导致节点被
+误判为“不在 Waiting”而丢失唤醒。现在改为
+`try_spin_compare_exchange_weak(expect, desire)`：`Fail` 会重试，只有
+`Unexpected`（确实不是 Waiting）才返回 `None`。Miri 8 个 core 单测已覆盖。

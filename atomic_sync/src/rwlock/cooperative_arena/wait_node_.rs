@@ -34,9 +34,11 @@ use core::{
     cell::{Cell, UnsafeCell},
     hint,
     ptr::NonNull,
-    sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize},
     task::Waker,
 };
+
+use atomex::{AtomexPtr, AtomicFlags, CmpxchResult};
 
 use crate::rwlock::wait_::WaitKind;
 
@@ -57,6 +59,15 @@ pub(super) const READER_ADMITTED: u8 = 3;
 pub(super) const READER_ACQUIRED: u8 = 4;
 /// 读者已取消。
 pub(super) const READER_CANCELLED: u8 = 5;
+
+/// 写者仍在等待放行。
+pub(super) const SLOT_WAITING: u8 = 0;
+/// 写者已放行。
+pub(super) const SLOT_ADMITTED: u8 = 1;
+/// 写者已领取许可。
+pub(super) const SLOT_ACQUIRED: u8 = 2;
+/// 写者已取消。
+pub(super) const SLOT_CANCELLED: u8 = 3;
 
 /// 一个等待节点。
 ///
@@ -230,52 +241,69 @@ pub(super) enum WakeNode {
 /// `state_` 的低位是持锁读者数，最高位是可升级读持锁标记；`tail_` 是最后
 /// 加入的读者节点，读者链通过每个节点的 `prev_` 反向串起来。
 pub(super) struct RootRead {
-    state_: AtomicUsize,
-    tail_: AtomicPtr<WaitNode>,
+    state_: AtomicFlags<usize>,
+    tail_: AtomexPtr<WaitNode>,
 }
 
 impl RootRead {
     fn new() -> Self {
         RootRead {
-            state_: AtomicUsize::new(0),
-            tail_: AtomicPtr::new(core::ptr::null_mut()),
+            state_: AtomicFlags::new(AtomicUsize::new(0)),
+            tail_: AtomexPtr::new(AtomicPtr::new(core::ptr::null_mut())),
         }
     }
 
     /// 当前持锁读者数（含已放行、尚未领取的读者）。
     #[inline]
     pub(super) fn count_(&self) -> usize {
-        self.state_.load(Ordering::Acquire) & COUNT_MASK
+        self.state_.value() & COUNT_MASK
     }
 
     /// 放行/领取一个读者时加一。
     #[inline]
     pub(super) fn inc_count_(&self) {
-        self.state_.fetch_add(1, Ordering::AcqRel);
+        let _ = self
+            .state_
+            .try_spin_compare_exchange_weak(|_| true, |value| value + 1);
     }
 
     /// 释放/取消一个已放行读者时减一；返回减一前的计数。
     #[inline]
     pub(super) fn dec_count_(&self) -> usize {
-        self.state_.fetch_sub(1, Ordering::AcqRel) & COUNT_MASK
+        match self
+            .state_
+            .try_spin_compare_exchange_weak(|value| value & COUNT_MASK != 0, |value| value - 1)
+        {
+            CmpxchResult::Succ(old) => old & COUNT_MASK,
+            other => {
+                debug_assert!(false, "RootRead count_ 下溢");
+                other.into_inner() & COUNT_MASK
+            }
+        }
     }
 
     /// 当前是否有已领取的可升级读持锁者。
     #[inline]
     pub(super) fn upgr_active_(&self) -> bool {
-        self.state_.load(Ordering::Acquire) & UPGR_BIT != 0
+        self.state_.value() & UPGR_BIT != 0
     }
 
     /// 标记可升级读持锁。
     #[inline]
     pub(super) fn set_upgr_active_(&self) {
-        self.state_.fetch_or(UPGR_BIT, Ordering::AcqRel);
+        let _ = self.state_.try_spin_compare_exchange_weak(
+            |value| value & UPGR_BIT == 0,
+            |value| value | UPGR_BIT,
+        );
     }
 
     /// 清除可升级读持锁标记。
     #[inline]
     pub(super) fn clear_upgr_active_(&self) {
-        self.state_.fetch_and(!UPGR_BIT, Ordering::AcqRel);
+        let _ = self.state_.try_spin_compare_exchange_weak(
+            |value| value & UPGR_BIT != 0,
+            |value| value & !UPGR_BIT,
+        );
     }
 
     /// 最后加入的读者节点。
@@ -286,7 +314,7 @@ impl RootRead {
     /// 安全地沿 `prev_` 遍历（遍历期间不会有新的发布者）。
     #[inline]
     pub(super) unsafe fn tail_(&self) -> Option<NonNull<WaitNode>> {
-        NonNull::new(self.tail_.load(Ordering::Acquire))
+        self.tail_.load()
     }
 
     /// 把读者节点压入组尾（原子 CAS）。
@@ -296,20 +324,14 @@ impl RootRead {
     /// - `node` 必须是刚分配、尚未发布到任何链表的读者节点；
     /// - 遍历者必须持有队列锁，保证发布后 `prev_` 链可安全读取。
     pub(super) unsafe fn push_reader_(&self, node: NonNull<WaitNode>) {
-        let mut old = self.tail_.load(Ordering::Acquire);
-        loop {
-            // SAFETY: `node` 尚未发布，独占写自己的 `prev_`。
-            unsafe { node.as_ref().set_prev_(NonNull::new(old)) };
-            match self.tail_.compare_exchange_weak(
-                old,
-                node.as_ptr(),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Result::Ok(_) => return,
-                Result::Err(actual) => old = actual,
-            }
-        }
+        let _ = self.tail_.try_spin_compare_exchange_weak(
+            |_| true,
+            |current| {
+                // SAFETY: `node` 尚未发布，独占写自己的 `prev_`。
+                unsafe { node.as_ref().set_prev_(NonNull::new(current)) };
+                node.as_ptr()
+            },
+        );
     }
 
     /// 链中是否还有尚未放行的读者（`Registering` 或 `Waiting`）。
@@ -318,18 +340,15 @@ impl RootRead {
     ///
     /// 调用方必须持有队列锁。
     pub(super) unsafe fn has_pending_(&self) -> bool {
-        let mut cur = self.tail_.load(Ordering::Acquire);
-        while let Some(node) = NonNull::new(cur) {
+        let mut cur = self.tail_.load();
+        while let Some(node) = cur {
             // SAFETY: 链节点在组存活期间有效；持有队列锁。
             let node_ref = unsafe { node.as_ref() };
             if node_ref.as_reader_().is_pending_() {
                 return true;
             }
             // SAFETY: 同上。
-            cur = match unsafe { node_ref.prev_() } {
-                Some(prev) => prev.as_ptr(),
-                Option::None => core::ptr::null_mut(),
-            };
+            cur = unsafe { node_ref.prev_() };
         }
         false
     }
@@ -340,18 +359,15 @@ impl RootRead {
     ///
     /// 调用方必须持有队列锁。
     pub(super) unsafe fn has_upgr_read_(&self) -> bool {
-        let mut cur = self.tail_.load(Ordering::Acquire);
-        while let Some(node) = NonNull::new(cur) {
+        let mut cur = self.tail_.load();
+        while let Some(node) = cur {
             // SAFETY: 链节点在组存活期间有效；持有队列锁。
             let node_ref = unsafe { node.as_ref() };
             if node_ref.is_upgr_read_() {
                 return true;
             }
             // SAFETY: 同上。
-            cur = match unsafe { node_ref.prev_() } {
-                Some(prev) => prev.as_ptr(),
-                Option::None => core::ptr::null_mut(),
-            };
+            cur = unsafe { node_ref.prev_() };
         }
         false
     }
@@ -366,7 +382,7 @@ pub(super) struct ReaderNode {
     /// 所属读者组。
     root_: NonNull<WaitNode>,
     /// 读者状态机；无需队列锁。
-    state_: AtomicU8,
+    state_: AtomicFlags<u8>,
     /// waker；只在 `Registering` / `Taking` 状态下被独占访问。
     waker_: UnsafeCell<Option<Waker>>,
 }
@@ -375,7 +391,7 @@ impl ReaderNode {
     fn new(root: NonNull<WaitNode>) -> Self {
         ReaderNode {
             root_: root,
-            state_: AtomicU8::new(READER_REGISTERING),
+            state_: AtomicFlags::new(AtomicU8::new(READER_REGISTERING)),
             waker_: UnsafeCell::new(Option::None),
         }
     }
@@ -389,7 +405,7 @@ impl ReaderNode {
     /// 当前状态。
     #[inline]
     pub(super) fn state_(&self) -> u8 {
-        self.state_.load(Ordering::Acquire)
+        self.state_.value()
     }
 
     /// 是否尚未放行（`Registering` / `Waiting`）。
@@ -405,44 +421,36 @@ impl ReaderNode {
     /// 降回 `Waiting`（否则会把已累加的持锁计数弄丢）。
     pub(super) fn register_waker_(&self, waker: &Waker) -> bool {
         loop {
-            let old = self.state_.load(Ordering::Acquire);
-            match old {
-                READER_ADMITTED | READER_ACQUIRED | READER_CANCELLED => return false,
-                READER_TAKING => {
+            match self.state_.try_spin_compare_exchange_weak(
+                |state| matches!(state, READER_REGISTERING | READER_WAITING),
+                |_| READER_REGISTERING,
+            ) {
+                CmpxchResult::Succ(_) => {}
+                CmpxchResult::Unexpected(READER_TAKING) => {
                     hint::spin_loop();
                     continue;
                 }
-                READER_REGISTERING | READER_WAITING => {}
-                _ => return false,
-            }
-            if self
-                .state_
-                .compare_exchange(old, READER_REGISTERING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
+                CmpxchResult::Unexpected(_) => return false,
+                CmpxchResult::Fail(_) => continue,
             }
             // SAFETY: 状态为 `Registering`，唤醒者不会访问 waker。
             let slot = unsafe { &mut *self.waker_.get() };
             if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {
                 *slot = Option::Some(waker.clone());
             }
-            if self
-                .state_
-                .compare_exchange(
-                    READER_REGISTERING,
-                    READER_WAITING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                // SAFETY: 状态已不是 `Registering`，没有其他线程会取这个
-                // waker；清掉它，避免泄漏。
-                unsafe { *self.waker_.get() = Option::None };
-                return false;
+            match self.state_.try_spin_compare_exchange_weak(
+                |state| state == READER_REGISTERING,
+                |_| READER_WAITING,
+            ) {
+                CmpxchResult::Succ(_) => return true,
+                CmpxchResult::Fail(_) => continue,
+                CmpxchResult::Unexpected(_) => {
+                    // SAFETY: 状态已不是 `Registering`，没有其他线程会取
+                    // 这个 waker；清掉它，避免泄漏。
+                    unsafe { *self.waker_.get() = Option::None };
+                    return false;
+                }
             }
-            return true;
         }
     }
 
@@ -451,44 +459,36 @@ impl ReaderNode {
     /// 调用方必须已经把放行时累加的持锁计数减掉。
     pub(super) fn rewait_(&self, waker: &Waker) -> bool {
         loop {
-            let old = self.state_.load(Ordering::Acquire);
-            match old {
-                READER_ACQUIRED | READER_CANCELLED => return false,
-                READER_TAKING => {
+            match self.state_.try_spin_compare_exchange_weak(
+                |state| matches!(state, READER_ADMITTED | READER_REGISTERING | READER_WAITING),
+                |_| READER_REGISTERING,
+            ) {
+                CmpxchResult::Succ(_) => {}
+                CmpxchResult::Unexpected(READER_TAKING) => {
                     hint::spin_loop();
                     continue;
                 }
-                READER_ADMITTED | READER_REGISTERING | READER_WAITING => {}
-                _ => return false,
-            }
-            if self
-                .state_
-                .compare_exchange(old, READER_REGISTERING, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
+                CmpxchResult::Unexpected(_) => return false,
+                CmpxchResult::Fail(_) => continue,
             }
             // SAFETY: 状态为 `Registering`，唤醒者不会访问 waker。
             let slot = unsafe { &mut *self.waker_.get() };
             if !slot.as_ref().is_some_and(|w| w.will_wake(waker)) {
                 *slot = Option::Some(waker.clone());
             }
-            if self
-                .state_
-                .compare_exchange(
-                    READER_REGISTERING,
-                    READER_WAITING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                // SAFETY: 状态已不是 `Registering`，没有其他线程会取这个
-                // waker；清掉它，避免泄漏。
-                unsafe { *self.waker_.get() = Option::None };
-                return false;
+            match self.state_.try_spin_compare_exchange_weak(
+                |state| state == READER_REGISTERING,
+                |_| READER_WAITING,
+            ) {
+                CmpxchResult::Succ(_) => return true,
+                CmpxchResult::Fail(_) => continue,
+                CmpxchResult::Unexpected(_) => {
+                    // SAFETY: 状态已不是 `Registering`，没有其他线程会取
+                    // 这个 waker；清掉它，避免泄漏。
+                    unsafe { *self.waker_.get() = Option::None };
+                    return false;
+                }
             }
-            return true;
         }
     }
 
@@ -496,15 +496,12 @@ impl ReaderNode {
     ///
     /// 返回 `None` 表示节点不在 `Waiting`，或 waker 已经不在。
     pub(super) fn try_admit_(&self) -> Option<Waker> {
-        if self
+        // 使用会重试 `Fail` 的版本：weak CAS 可能伪失败（Miri 也会模拟），
+        // 不能把一次伪失败当成“节点不在 Waiting”。
+        if !self
             .state_
-            .compare_exchange(
-                READER_WAITING,
-                READER_TAKING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
+            .try_spin_compare_exchange_weak(|state| state == READER_WAITING, |_| READER_TAKING)
+            .is_succ()
         {
             return Option::None;
         }
@@ -512,14 +509,20 @@ impl ReaderNode {
         let waker = unsafe { &mut *self.waker_.get() }.take();
         match waker {
             Option::Some(waker) => {
-                self.state_.store(READER_ADMITTED, Ordering::Release);
+                let _ = self.state_.try_spin_compare_exchange_weak(
+                    |state| state == READER_TAKING,
+                    |_| READER_ADMITTED,
+                );
                 Option::Some(waker)
             }
             Option::None => {
                 // `Waiting` 状态必须已经注册 waker；这里回退，避免把节点
                 // 留在一个不会被唤醒的 `Admitted` 状态。
                 debug_assert!(false, "ReaderNode: Waiting 状态缺少 waker");
-                self.state_.store(READER_WAITING, Ordering::Release);
+                let _ = self.state_.try_spin_compare_exchange_weak(
+                    |state| state == READER_TAKING,
+                    |_| READER_WAITING,
+                );
                 Option::None
             }
         }
@@ -527,7 +530,10 @@ impl ReaderNode {
 
     /// 标记已领取许可。
     pub(super) fn mark_acquired_(&self) {
-        self.state_.store(READER_ACQUIRED, Ordering::Release);
+        let _ = self.state_.try_spin_compare_exchange_weak(
+            |state| matches!(state, READER_ADMITTED | READER_REGISTERING),
+            |_| READER_ACQUIRED,
+        );
     }
 
     /// 取消读者；返回取消前的状态。
@@ -535,34 +541,28 @@ impl ReaderNode {
     /// 不需要队列锁；如果唤醒者正在 `Taking`，短暂自旋等它取完 waker。
     pub(super) fn cancel_(&self) -> u8 {
         loop {
-            let old = self.state_.load(Ordering::Acquire);
-            match old {
-                READER_TAKING => {
+            match self.state_.try_spin_compare_exchange_weak(
+                |state| !matches!(state, READER_ACQUIRED | READER_CANCELLED | READER_TAKING),
+                |_| READER_CANCELLED,
+            ) {
+                CmpxchResult::Succ(old) => {
+                    if matches!(old, READER_WAITING | READER_REGISTERING) {
+                        // SAFETY: 状态已变成 `Cancelled`，唤醒者不会再取 waker。
+                        unsafe { *self.waker_.get() = Option::None };
+                    }
+                    return old;
+                }
+                CmpxchResult::Unexpected(READER_TAKING) => {
                     hint::spin_loop();
-                    continue;
                 }
-                READER_ACQUIRED | READER_CANCELLED => return old,
-                _ => {}
-            }
-            if self
-                .state_
-                .compare_exchange(old, READER_CANCELLED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                // `Waiting` 的 waker 还没被取走，清掉它。`Registering` 的
-                // waker 可能正在写；这里只可能由同一 future 的 Drop 触发，
-                // 与注册不会并发，清净处理即可。
-                if matches!(old, READER_WAITING | READER_REGISTERING) {
-                    // SAFETY: 状态已变成 `Cancelled`，唤醒者不会再取 waker。
-                    unsafe { *self.waker_.get() = Option::None };
-                }
-                return old;
+                CmpxchResult::Unexpected(state) => return state,
+                CmpxchResult::Fail(_) => {}
             }
         }
     }
 }
 
-//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
+//-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 // WriteNode
 //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
 
@@ -577,7 +577,7 @@ pub(super) struct WriteNode {
     /// 是否已经计入 `writer_waiters_`；由队列锁保护。
     counted_: Cell<bool>,
     /// 槽位状态；由队列锁保护。
-    state_: Cell<SlotState>,
+    state_: AtomicFlags<u8>,
     /// 已注册的 waker；由队列锁保护。
     waker_: UnsafeCell<Option<Waker>>,
 }
@@ -588,7 +588,7 @@ impl WriteNode {
             kind_: kind,
             root_: root,
             counted_: Cell::new(false),
-            state_: Cell::new(SlotState::Waiting),
+            state_: AtomicFlags::new(AtomicU8::new(SLOT_WAITING)),
             waker_: UnsafeCell::new(Option::None),
         }
     }
@@ -623,8 +623,8 @@ impl WriteNode {
 
     /// 当前状态。
     #[inline]
-    pub(super) fn state_(&self) -> SlotState {
-        self.state_.get()
+    pub(super) fn state_(&self) -> u8 {
+        self.state_.value()
     }
 
     /// 设置状态。
@@ -633,8 +633,10 @@ impl WriteNode {
     ///
     /// 调用方必须持有队列锁。
     #[inline]
-    pub(super) unsafe fn set_state_(&self, state: SlotState) {
-        self.state_.set(state);
+    pub(super) unsafe fn set_state_(&self, state: u8) {
+        let _ = self
+            .state_
+            .try_spin_compare_exchange_weak(|_| true, |_| state);
     }
 
     /// 取走 waker。
@@ -673,17 +675,4 @@ impl WriteNode {
         // SAFETY: 由调用方保证持有队列锁。
         unsafe { *self.waker_.get() = Option::None };
     }
-}
-
-/// 写者槽位状态。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SlotState {
-    /// 仍在等待放行。
-    Waiting,
-    /// 已放行，waker 已交出，等待 future 自己领取。
-    Admitted,
-    /// 已成功领取许可。
-    Acquired,
-    /// 等待者被取消。
-    Cancelled,
 }

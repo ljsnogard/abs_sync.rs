@@ -19,17 +19,11 @@
 //! - 升级请求只有在真正发起时才插入 `PureWrite(Upgrade)`；不做预留。
 
 use alloc::alloc::{Global, handle_alloc_error};
-use core::{
-    borrow::BorrowMut,
-    hint,
-    ptr::NonNull,
-    sync::atomic::{AtomicPtr, Ordering},
-    task::Waker,
-};
+use core::{borrow::BorrowMut, hint, ptr::NonNull, sync::atomic::AtomicPtr, task::Waker};
 
 use funty::Unsigned;
 
-use atomex::{StrictOrderings, TrAtomicData, TrCmpxchOrderings, x_deps::funty};
+use atomex::{AtomexPtr, StrictOrderings, TrAtomicData, TrCmpxchOrderings, x_deps::funty};
 
 use crate::rwlock::{
     state_::CoopRwState,
@@ -40,7 +34,8 @@ use super::{
     arena_::Arena,
     wait_node_::{
         READER_ACQUIRED, READER_ADMITTED, READER_CANCELLED, READER_REGISTERING, READER_TAKING,
-        READER_WAITING, ReaderNode, SlotState, WaitNode,
+        READER_WAITING, ReaderNode, SLOT_ACQUIRED, SLOT_ADMITTED, SLOT_CANCELLED, SLOT_WAITING,
+        WaitNode,
     },
 };
 
@@ -140,7 +135,7 @@ where
 {
     stat_: CoopRwState<D, B, O>,
     /// 当前唯一活跃读者组的根；快速路径读者不参与。
-    active_read_group_: AtomicPtr<WaitNode>,
+    active_read_group_: AtomexPtr<WaitNode>,
     queue_: SpinLock<QueuePayload>,
 }
 
@@ -153,7 +148,7 @@ where
     pub(super) const fn new(cell: B) -> Self {
         RwCoreArena {
             stat_: CoopRwState::new(cell),
-            active_read_group_: AtomicPtr::new(core::ptr::null_mut()),
+            active_read_group_: AtomexPtr::new(AtomicPtr::new(core::ptr::null_mut())),
             queue_: SpinLock::new(QueuePayload {
                 head_: Option::None,
                 tail_: Option::None,
@@ -343,10 +338,10 @@ where
         let write = node.as_write_();
         let state = write.state_();
 
-        if state == SlotState::Admitted {
+        if state == SLOT_ADMITTED {
             if self.try_claim_(pending.kind_) {
                 // SAFETY: 持有队列锁。
-                unsafe { write.set_state_(SlotState::Acquired) };
+                unsafe { write.set_state_(SLOT_ACQUIRED) };
                 self.finish_write_node_(&mut q, pending.node_);
                 drop(q);
                 return true;
@@ -354,7 +349,7 @@ where
             // 状态字竞争失败：回到 Waiting。
             // SAFETY: 持有队列锁。
             unsafe {
-                write.set_state_(SlotState::Waiting);
+                write.set_state_(SLOT_WAITING);
                 write.set_waker_(waker);
             }
             drop(q);
@@ -362,7 +357,7 @@ where
             return false;
         }
 
-        if state == SlotState::Waiting {
+        if state == SLOT_WAITING {
             self.register_waker_(pending, waker);
             drop(q);
             self.run_pass_();
@@ -443,11 +438,11 @@ where
         let mut q = self.queue_.lock();
         let write = node.as_write_();
         let old = write.state_();
-        debug_assert!(old != SlotState::Acquired, "取消已经领取的写者");
-        if matches!(old, SlotState::Waiting | SlotState::Admitted) {
+        debug_assert!(old != SLOT_ACQUIRED, "取消已经领取的写者");
+        if matches!(old, SLOT_WAITING | SLOT_ADMITTED) {
             // SAFETY: 持有队列锁。
             unsafe {
-                write.set_state_(SlotState::Cancelled);
+                write.set_state_(SLOT_CANCELLED);
                 write.clear_waker_();
             }
             self.finish_write_node_(&mut q, pending.node_);
@@ -572,7 +567,7 @@ where
                 && self.try_claim_(WaitKind::Upgrade)
             {
                 // SAFETY: 持有队列锁。
-                unsafe { write.set_state_(SlotState::Acquired) };
+                unsafe { write.set_state_(SLOT_ACQUIRED) };
                 self.set_active_group_(group);
                 self.finish_write_node_(q, pending.node_);
                 return true;
@@ -597,7 +592,7 @@ where
         }
         if self.try_claim_(pending.kind_) {
             // SAFETY: 持有队列锁。
-            unsafe { write.set_state_(SlotState::Acquired) };
+            unsafe { write.set_state_(SLOT_ACQUIRED) };
             self.finish_write_node_(q, pending.node_);
             return true;
         }
@@ -610,7 +605,7 @@ where
         let write = node.as_write_();
         // SAFETY: 持有队列锁。
         unsafe {
-            write.set_state_(SlotState::Waiting);
+            write.set_state_(SLOT_WAITING);
             write.set_waker_(waker);
         }
     }
@@ -682,7 +677,7 @@ where
                         let write = next_node.as_write_();
                         if write.kind_() == WaitKind::Upgrade
                             && write.root_() == Option::Some(front)
-                            && matches!(write.state_(), SlotState::Waiting | SlotState::Admitted)
+                            && matches!(write.state_(), SLOT_WAITING | SLOT_ADMITTED)
                             && snap.reader_count == D::ONE
                             && snap.upgrade_active
                         {
@@ -695,7 +690,7 @@ where
         }
 
         let write = node.as_write_();
-        if matches!(write.state_(), SlotState::Acquired | SlotState::Cancelled) {
+        if matches!(write.state_(), SLOT_ACQUIRED | SLOT_CANCELLED) {
             return Option::None;
         }
         let admitted = match write.kind_() {
@@ -743,12 +738,12 @@ where
                 let mut batch = WakerBatch::new();
                 // SAFETY: `node` 是 select_head_ 选中的存活节点。
                 let write = unsafe { node.as_ref() }.as_write_();
-                if write.state_() == SlotState::Waiting
+                if write.state_() == SLOT_WAITING
                     // SAFETY: 持有队列锁。
                     && let Option::Some(waker) = unsafe { write.take_waker_() }
                 {
                     // SAFETY: 持有队列锁。
-                    unsafe { write.set_state_(SlotState::Admitted) };
+                    unsafe { write.set_state_(SLOT_ADMITTED) };
                     batch.push(waker);
                 }
                 batch
@@ -915,30 +910,20 @@ where
     }
 
     fn set_active_group_(&self, group: NonNull<WaitNode>) {
-        let expected = core::ptr::null_mut();
-        let _ = self.active_read_group_.compare_exchange(
-            expected,
-            group.as_ptr(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-        debug_assert!(
-            self.active_read_group_.load(Ordering::Acquire) == group.as_ptr(),
-            "同时出现两个活跃读者组"
-        );
+        match self.active_read_group_.try_spin_init(group) {
+            Result::Ok(_) => {}
+            Result::Err(existing) => {
+                debug_assert_eq!(existing, group, "同时出现两个活跃读者组");
+            }
+        }
     }
 
     fn clear_active_group_(&self, group: NonNull<WaitNode>) {
-        let _ = self.active_read_group_.compare_exchange(
-            group.as_ptr(),
-            core::ptr::null_mut(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ = self.active_read_group_.try_spin_compare_and_reset(group);
     }
 
     fn active_group_(&self) -> Option<NonNull<WaitNode>> {
-        NonNull::new(self.active_read_group_.load(Ordering::Acquire))
+        self.active_read_group_.load()
     }
 
     //-- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ---- ----
