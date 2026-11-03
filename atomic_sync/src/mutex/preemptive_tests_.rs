@@ -15,6 +15,7 @@
 
 use std::{
     boxed::Box,
+    cell::Cell,
     string::String,
     sync::{
         atomic::{AtomicPtr, AtomicUsize, Ordering},
@@ -340,4 +341,22 @@ fn may_break_with_cancelled_token_returns_none_while_held() {
         }
         Err(e) => panic!("{e:?}"),
     }
+}
+
+/// 测试 `Send + !Sync` 的被保护值经自旋锁后仍是 `Send + Sync`。
+/// Test that a `Send + !Sync` payload becomes `Send + Sync` behind the spinlock.
+///
+/// - 手段：用 `Cell<u32>`（`Send + !Sync`）实例化 `SpinningMutexOwned`，再对它做
+///   `Send + Sync` 的静态断言。
+/// - 判断：编译通过才说明锁把共享访问串行化后，被保护值只需 `Send`；若边界退回
+///   `T: Sync`，这条测试会直接在编译期失败。
+///
+/// - Means: instantiate `SpinningMutexOwned` with `Cell<u32>` (`Send + !Sync`) and apply
+///   a static `Send + Sync` assertion to the mutex type.
+/// - Verdict: compilation succeeds only if serialised shared access lets the payload need
+///   just `Send`; a regression to `T: Sync` makes this test fail at compile time.
+#[test]
+fn mutex_over_send_not_sync_is_send_sync() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SpinningMutexOwned<Cell<u32>>>();
 }

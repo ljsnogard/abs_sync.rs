@@ -235,20 +235,25 @@ where
     }
 }
 
+// 线程安全边界与 `std::sync::Mutex` 一致：锁把对 `T` 的访问串行化，被保护的值只需
+// 能安全地**交给**另一个线程（`T: Send`），不需要本身可并发共享（`T: Sync`）。旧实现
+// 写成 `T: Sync`，会把 `bumpalo::Bump` 这类 `Send + !Sync` 的值错误地排除在
+// `Send`/`Sync` 之外；同时 `Send` 条件漏掉 `T: Send`，对 `Sync + !Send` 的类型并不成立。
+// `B` 是锁状态载体（原子单元或其可变借用），分别按 `Send` / `Sync` 传播。
 unsafe impl<T, D, B, S, O> Send for SpinningMutex<T, D, B, S, O>
 where
-    T: Sync + ?Sized,
+    T: Send + ?Sized,
     D: Unsigned + TrAtomicData,
-    B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
+    B: Send + BorrowMut<<D as TrAtomicData>::AtomicCell>,
     S: TrMutexSignal<D>,
     O: TrCmpxchOrderings,
 {}
 
 unsafe impl<T, D, B, S, O> Sync for SpinningMutex<T, D, B, S, O>
 where
-    T: Sync + ?Sized,
+    T: Send + ?Sized,
     D: Unsigned + TrAtomicData,
-    B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
+    B: Sync + BorrowMut<<D as TrAtomicData>::AtomicCell>,
     S: TrMutexSignal<D>,
     O: TrCmpxchOrderings,
 {}
@@ -529,10 +534,13 @@ where
     O: TrCmpxchOrderings,
 {}
 
+// 共享 `&MutexGuard` 只会经 `Deref` 给出 `&T`，因此要求 `T: Sync`（与
+// `std::sync::MutexGuard` 一致）。锁状态本身不会被共享访问改写：guard 的 `Drop`
+// 需要所有权，`Deref` 只读取 `T`。
 unsafe impl<'a, 'g, T, D, B, S, O> Sync for MutexGuard<'a, 'g, T, D, B, S, O>
 where
     'a: 'g,
-    T: ?Sized,
+    T: Sync + ?Sized,
     D: TrAtomicData + Copy,
     B: BorrowMut<<D as TrAtomicData>::AtomicCell>,
     S: TrMutexSignal<D>,
