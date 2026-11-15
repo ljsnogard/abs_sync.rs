@@ -12,8 +12,11 @@ license.workspace = true
 readme = "README.md"
 
 [features]
+# 128 位原子类型（AtomicI128/AtomicU128）仍是 nightly-only
+# （`#![feature(integer_atomics)]`，rust-lang/rust#99069）。作为可选能力提供：
+# 默认关闭；需要时在 nightly 上显式开启。
 support_u128_i128_atomics = []
-default = ["support_u128_i128_atomics"]
+default = []
 
 [dependencies]
 funty = { version = "3.0.0-rc2", default-features = false }
